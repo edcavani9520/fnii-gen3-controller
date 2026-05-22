@@ -23,7 +23,7 @@ class KinovaJoyTeleop:
         
         # 控制参数 / Control Parameters
         self.deadzone = 0.1      
-        self.speed_limit = 0.05  
+        self.speed_limit = 0.1  
         self.turn_limit = 20.0   
 
         # 初始化 Pygame 手柄 / Initialize Joystick
