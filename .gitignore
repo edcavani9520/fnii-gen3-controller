@@ -6,6 +6,6 @@ __pycache__/
 *$py.class
 *.pyc
 
-data/
+/data/
 
 /lerobot/
