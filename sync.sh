@@ -25,4 +25,4 @@ git commit -m "$desc"
 echo "正在推送到 GitHub..."
 git push origin main
 
-echo "✅ 同步完成！"
+echo "✅ 同步完成！" 

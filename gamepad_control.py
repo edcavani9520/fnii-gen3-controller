@@ -5,7 +5,14 @@ import pygame
 import threading
 
 # 动态添加 utilities 路径
-sys.path.insert(0, "/home/cuhk/Documents/visionpro-kinova-rl/Kinova-kortex2_Gen3_G3L/api_python/examples")
+sys.path.insert(0, "/home/fnii/lzhzzy/gen3/KinovaGen3_Easy_Control/Kinova_kortex2_Gen3_G3L/api_python/examples")
+
+
+
+# 获取当前脚本所在目录
+current_dir = os.path.dirname(os.path.abspath(__file__))
+examples_dir = os.path.join(current_dir, '..', 'api_python', 'examples')
+sys.path.insert(0, os.path.abspath(examples_dir))
 import utilities
 
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
