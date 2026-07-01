@@ -13,19 +13,19 @@
 
 ## 📂 目录结构说明
 
-| 文件/文件夹 | 说明 |
-| --- | --- |
-| **`kinova_manage.py`** | **核心控制代码**。包含所有的控制类和函数。 |
-| **`kinova_manage.pyi`** | **函数说明文档**。专门为 `kinova_manage.py` 编写的接口解释，方便开发者查看。 |
-| **`kortex_api/`** | Kinova 官方 SDK 包。本项目已内置，用户无需手动安装。 |
-| **`Kinova_kortex2_Gen3_G3L/`** | 官方原始资源包。包含参考代码和示例。 |
-| **`visionpro_control.py`** | 使用 Apple Vision Pro 进行机械臂遥操的主程序。 |
-| **`gamepad_control_obs.py`** | 手柄控制脚本（含数据监测）。可在终端实时查看机械臂状态数据。 |
-| **`gamepad_control.py`** | 基础手柄控制脚本（无数据反馈）。 |
-| **`isbot/`** | 存档：前同事的旧版控制方法（基于力矩控制，不支持笛卡尔控制）。 |
-| **`api_control/`** | 存档：存放旧版 README 及部分历史文件。 |
-| **`requirements.txt`** | 环境依赖清单。 |
-| **`sync.sh`** | GitHub 自动化同步脚本。 |
+| 文件/文件夹                    | 说明                                                                         |
+| ------------------------------ | ---------------------------------------------------------------------------- |
+| **`kinova_manage.py`**         | **核心控制代码**。包含所有的控制类和函数。                                   |
+| **`kinova_manage.pyi`**        | **函数说明文档**。专门为 `kinova_manage.py` 编写的接口解释，方便开发者查看。 |
+| **`kortex_api/`**              | Kinova 官方 SDK 包。本项目已内置，用户无需手动安装。                         |
+| **`Kinova_kortex2_Gen3_G3L/`** | 官方原始资源包。包含参考代码和示例。                                         |
+| **`visionpro_control.py`**     | 使用 Apple Vision Pro 进行机械臂遥操的主程序。                               |
+| **`gamepad_control_obs.py`**   | 手柄控制脚本（含数据监测）。可在终端实时查看机械臂状态数据。                 |
+| **`gamepad_control.py`**       | 基础手柄控制脚本（无数据反馈）。                                             |
+| **`isbot/`**                   | 存档：前同事的旧版控制方法（基于力矩控制，不支持笛卡尔控制）。               |
+| **`api_control/`**             | 存档：存放旧版 README 及部分历史文件。                                       |
+| **`requirements.txt`**         | 环境依赖清单。                                                               |
+| **`sync.sh`**                  | GitHub 自动化同步脚本。                                                      |
 
 ---
 
@@ -43,7 +43,7 @@ conda activate kinova_env
 
 2. **安装依赖**：
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-py.txt
 
 ```
 
