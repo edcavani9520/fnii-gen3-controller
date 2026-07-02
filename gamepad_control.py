@@ -5,7 +5,7 @@ import pygame
 import threading
 
 # 动态添加 utilities 路径
-sys.path.insert(0, "/home/fnii/lzhzzy/gen3/KinovaGen3_Easy_Control/Kinova_kortex2_Gen3_G3L/api_python/examples")
+sys.path.insert(0, "/home/kinova-1/Kinova-gen3/gen3-controller/Kinova_kortex2_Gen3_G3L/api_python/examples")
 
 
 

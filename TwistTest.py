@@ -3,7 +3,7 @@ import os
 import time
 
 # 动态添加 utilities 路径
-sys.path.insert(0, "/home/cuhk/Documents/visionpro-kinova-rl/Kinova-kortex2_Gen3_G3L/api_python/examples")
+sys.path.insert(0, "/home/kinova-1/Kinova-gen3/gen3-controller/Kinova_kortex2_Gen3_G3L/api_python/examples")
 import utilities
 
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
