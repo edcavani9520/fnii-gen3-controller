@@ -1,5 +1,4 @@
 import sys
-import os
 import time
 
 # 动态添加 utilities 路径
@@ -44,16 +43,24 @@ class KinovaJoyTeleop:
         except Exception:
             pass
 
-    def display_status(self, axes, hat, gripper_status):
-        """在终端实时刷新显示状态"""
-        # 构造手柄状态字符串
-        joy_str = f"Joy -> X:{axes[1]:.2f} Y:{axes[0]:.2f} Z:{(axes[5]-axes[2]):.2f} | R:{axes[3]:.2f} P:{axes[4]:.2f} Y:{hat[0]:.2f} | Grip:{gripper_status}"
-        # 构造机器人位姿字符串
-        pose_str = f"Pose -> X:{self.current_pose[0]:.3f} Y:{self.current_pose[1]:.3f} Z:{self.current_pose[2]:.3f} | Roll:{self.current_pose[3]:.1f} Pitch:{self.current_pose[4]:.1f} Yaw:{self.current_pose[5]:.1f}"
-        
-        # \r 使光标回到行首，实现原地刷新
-        sys.stdout.write(f"\r{joy_str}  ||  {pose_str}    ")
-        sys.stdout.flush()
+    def control_gripper(self, pos):
+        """pos: 0.0 为全开，1.0 为全关"""
+        gripper_command = Base_pb2.GripperCommand()
+        gripper_command.mode = Base_pb2.GRIPPER_POSITION
+        finger = gripper_command.gripper.finger.add()
+        finger.finger_identifier = 1
+        finger.value = float(max(0.0, min(1.0, pos)))
+        self.base.SendGripperCommand(gripper_command)
+
+    def get_gripper_position(self):
+        """读取夹爪当前位置(0.0~1.0)，读取失败则抛出异常。"""
+        req = Base_pb2.GripperRequest()
+        req.mode = Base_pb2.GRIPPER_POSITION
+        meas = self.base.GetMeasuredGripperMovement(req)
+        if len(meas.finger) == 0:
+            raise RuntimeError("GetMeasuredGripperMovement 返回空 finger")
+        return float(meas.finger[0].value)
+
 
     def run(self):
         try:
@@ -100,23 +107,7 @@ class KinovaJoyTeleop:
                     self.connection.__exit__(None, None, None)
             print("\n👋 程序已安全退出。")
 
-    def control_gripper(self, pos):
-        """pos: 0.0 为全开，1.0 为全关"""
-        gripper_command = Base_pb2.GripperCommand()
-        gripper_command.mode = Base_pb2.GRIPPER_POSITION
-        finger = gripper_command.gripper.finger.add()
-        finger.finger_identifier = 1
-        finger.value = float(max(0.0, min(1.0, pos)))
-        self.base.SendGripperCommand(gripper_command)
 
-    def get_gripper_position(self):
-        """读取夹爪当前位置(0.0~1.0)，读取失败则抛出异常。"""
-        req = Base_pb2.GripperRequest()
-        req.mode = Base_pb2.GRIPPER_POSITION
-        meas = self.base.GetMeasuredGripperMovement(req)
-        if len(meas.finger) == 0:
-            raise RuntimeError("GetMeasuredGripperMovement 返回空 finger")
-        return float(meas.finger[0].value)
 
 if __name__ == "__main__":
     teleop = KinovaJoyTeleop()
