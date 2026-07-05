@@ -223,3 +223,312 @@ ping 192.168.8.10
 
 ---
 
+# ROS 2 Humble + ros2_kortex 安装指南
+
+本项目支持通过 **ROS 2 Humble** + **ros2_kortex** 进行机械臂控制，提供话题订阅、rosbag 录制、可视化等功能，比原生 Kortex API 更适用于数据采集和机器人视觉任务。
+
+---
+
+## 1. 系统要求
+
+| 项目 | 要求 |
+|------|------|
+| **操作系统** | Ubuntu 22.04 (Jammy) — **注意：仅支持 22.04** |
+| **架构** | x86_64 |
+| **Python** | 3.10（系统自带） |
+| **机械臂** | Kinova Gen3 / Gen3 lite |
+
+---
+
+## 2. 安装 ROS 2 Humble
+
+### 2.1 添加 ROS 2 软件源
+
+```bash
+# 设置 locale
+sudo apt update && sudo apt install -y locales
+sudo locale-gen en_US en_US.UTF-8
+sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LANG=en_US.UTF-8
+
+# 添加 ROS 2 GPG key
+sudo apt install -y software-properties-common curl
+sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
+
+# 添加 ROS 2 仓库
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/ros2.list
+
+sudo apt update
+```
+
+### 2.2 安装 ROS 2 Humble Desktop
+
+```bash
+export DEBIAN_FRONTEND=noninteractive
+sudo apt install -y ros-humble-desktop
+```
+
+安装约 **282 个 ROS 2 包**（rclpy、rviz2、ros2bag、TF2、control_msgs 等）。
+
+### 2.3 安装编译工具
+
+```bash
+sudo apt install -y python3-colcon-common-extensions python3-vcstool python3-rosdep
+
+# 初始化 rosdep
+sudo rosdep init
+rosdep update
+```
+
+### 2.4 配置环境变量
+
+```bash
+echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
+source ~/.bashrc
+```
+
+验证安装：
+```bash
+ros2 -h
+python3 -c "import rclpy; print('rclpy OK')"
+```
+
+---
+
+## 3. 安装 ros2_kortex
+
+> **注意：** ROS 2 版本是独立的新仓库 `ros2_kortex`，**不是**旧版 ROS 1 的 `ros_kortex`。
+
+### 3.1 创建工作区
+
+```bash
+export COLCON_WS=~/ws/ros2_kortex_ws
+mkdir -p $COLCON_WS/src
+cd $COLCON_WS
+```
+
+### 3.2 克隆（Humble 分支）
+
+```bash
+git clone -b humble https://github.com/Kinovarobotics/ros2_kortex.git src/ros2_kortex
+```
+
+支持的 ROS 2 发行版：
+
+| ROS 2 版本 | 分支 | 状态 |
+|------------|------|------|
+| **Humble** | `humble` | ✅ Stable，有预编译二进制 |
+| Jazzy | `jazzy` | ✅ Stable (source only) |
+| Rolling | `main` | ⚠️ 不稳定 |
+
+### 3.3 导入依赖
+
+```bash
+cd $COLCON_WS
+vcs import src --skip-existing --input src/ros2_kortex/ros2_kortex.humble.repos
+vcs import src --skip-existing --input src/ros2_kortex/ros2_kortex-not-released.humble.repos
+```
+
+### 3.4 安装系统依赖
+
+```bash
+rosdep install --ignore-src --from-paths src -y -r
+```
+
+会自动安装：`ros2-control`、`ros2-controllers`、`moveit-*`、`backward-ros`、`control-toolbox`、`kinematics-interface`、`realtime-tools`、`libcap-dev` 等。
+
+### 3.5 编译
+
+```bash
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --parallel-workers 4
+```
+
+预期输出：成功编译 **10 个 kortex 包**（kortex_api、kortex_driver、kortex_bringup、kortex_description、MoveIt configs 等）。
+
+### 3.6 配置工作区环境
+
+```bash
+echo "source ~/ws/ros2_kortex_ws/install/setup.bash" >> ~/.bashrc
+
+# 可选：快捷别名
+echo 'alias ros2kortex="source /opt/ros/humble/setup.bash && source ~/ws/ros2_kortex_ws/install/setup.bash"' >> ~/.bashrc
+
+source ~/.bashrc
+```
+
+---
+
+## 4. 使用指南
+
+### 4.1 启动机械臂驱动
+
+```bash
+# 终端 1：启动驱动
+ros2 launch kortex_bringup gen3.launch.py \
+  robot_ip:=<机械臂 IP> \
+  use_fake_hardware:=false
+
+# 仿真模式（离线调试用）
+ros2 launch kortex_bringup gen3.launch.py \
+  robot_ip:=<机械臂 IP> \
+  use_fake_hardware:=true
+```
+
+启动后自动打开 RViz2。
+
+### 4.2 查看话题
+
+```bash
+# 另开一个终端
+source /opt/ros/humble/setup.bash
+source ~/ws/ros2_kortex_ws/install/setup.bash
+ros2 topic list
+```
+
+关键话题：
+
+| 话题 | 类型 | 说明 |
+|------|------|------|
+| `/joint_states` | `sensor_msgs/JointState` | 7 个关节角度 + 速度 |
+| `/tf` | `tf2_msgs/TFMessage` | TF 变换树 |
+| `/joint_trajectory_controller/joint_trajectory` | `trajectory_msgs/JointTrajectory` | 关节轨迹指令 |
+| `/twist_controller/commands` | `geometry_msgs/TwistStamped` | 末端速度指令 |
+
+### 4.3 关节位置控制
+
+```bash
+# 发送关节目标（2 秒内归零）
+ros2 action send_goal /joint_trajectory_controller/follow_joint_trajectory \
+  control_msgs/action/FollowJointTrajectory \
+  "trajectory:
+  joint_names: ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6', 'joint_7']
+  points:
+  - positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    time_from_start: {sec: 2, nanosec: 0}"
+
+# 多点轨迹
+ros2 action send_goal /joint_trajectory_controller/follow_joint_trajectory \
+  control_msgs/action/FollowJointTrajectory \
+  "trajectory:
+  joint_names: ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6', 'joint_7']
+  points:
+  - positions: [0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+    time_from_start: {sec: 2, nanosec: 0}
+  - positions: [0.5, 0.5, 0.3, 0.0, 0.0, 0.0, 0.0]
+    time_from_start: {sec: 5, nanosec: 0}"
+```
+
+### 4.4 末端 Twist 控制
+
+```bash
+# 持续发送末端速度（Ctrl+C 停止）
+ros2 topic pub /twist_controller/commands geometry_msgs/msg/TwistStamped \
+  "{header: {frame_id: 'tool_frame'}, twist: {linear: {x: 0.0, y: 0.0, z: 0.01}, angular: {x: 0.0, y: 0.0, z: 0.0}}}" \
+  --rate 10
+```
+
+### 4.5 rosbag 数据录制
+
+```bash
+# 所有话题
+ros2 bag record -a
+
+# 指定话题
+ros2 bag record /joint_states /tf /tf_static
+
+# 指定输出目录
+ros2 bag record -o motion_data /joint_states /tool_pose
+
+# 查看 bag 信息
+ros2 bag info motion_data/
+
+# 回放
+ros2 bag play motion_data/
+```
+
+### 4.6 查看关节状态
+
+```bash
+# 实时打印
+ros2 topic echo /joint_states
+
+# 一次性查看关节值
+ros2 topic echo /joint_states --once --field position
+
+# 查看发布频率
+ros2 topic hz /joint_states
+```
+
+---
+
+## 5. 常见问题
+
+### Q: RViz2 弹出但无机械臂模型
+A: `robot_state_publisher` 未正常启动，检查 launch 输出。
+
+### Q: spawner 持续等待 controller_manager service
+A: 驱动无法连接机械臂。检查：
+- `ping <robot_ip>` 是否通
+- 机械臂是否开机
+- PC 和机械臂是否同一网段
+
+### Q: ROS 2 实时调度警告
+```
+Could not enable FIFO RT scheduling policy
+```
+A: 正常警告，非实时 Linux 限制，不影响功能。
+
+### Q: rosbag 录到 0 条消息
+A: 录制前先 `ros2 topic list` 确认话题存在且有数据。
+
+### Q: cv_bridge 报 numpy 版本错误
+```
+AttributeError: _ARRAY_API not found
+```
+A: cv_bridge 依赖 numpy 1.x，需要降级：
+```bash
+pip install 'numpy<2' 'opencv-python<5'
+```
+
+---
+
+## 6. Python 编程示例
+
+```python
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+
+class JointLogger(Node):
+    def __init__(self):
+        super().__init__('joint_logger')
+        self.sub = self.create_subscription(
+            JointState, '/joint_states', self.cb, 10)
+
+    def cb(self, msg):
+        joints = [f"{j:.3f}" for j in msg.position[:7]]
+        self.get_logger().info(f'joints: [{joints}]')
+
+rclpy.init()
+rclpy.spin(JointLogger())
+rclpy.shutdown()
+```
+
+---
+
+## 7. 与原生 Kortex API 对比
+
+| 特性 | 原生 Kortex API | ROS 2 + ros2_kortex |
+|------|----------------|---------------------|
+| 安装复杂度 | ✅ 简单 | ⚠️ 稍复杂 |
+| 数据采集 | ❌ 手动记录 | ✅ rosbag 一键录制 |
+| 时间同步 | ❌ 无 | ✅ message_filters |
+| 可视化 | ❌ 无 | ✅ RViz2 |
+| 多传感器融合 | ❌ 需自建 | ✅ 原生支持 |
+| MoveIt 规划 | ❌ 无 | ✅ 内置配置 |
+
+对于数据采集 + 视觉类项目，推荐 ROS 2。
+
+---
+
