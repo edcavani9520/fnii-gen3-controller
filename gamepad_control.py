@@ -5,7 +5,7 @@ import pygame
 import threading
 
 # 动态添加 utilities 路径
-sys.path.insert(0, "/home/kinova-1/Kinova-gen3/gen3-controller/Kinova_kortex2_Gen3_G3L/api_python/examples")
+sys.path.insert(0, "/home/kinova-1/fnii-gen3-controller/Kinova_kortex2_Gen3_G3L/api_python/examples")
 
 
 
@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(examples_dir))
 import utilities
 
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
+from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.messages import Base_pb2
 
 class KinovaJoyTeleop:
@@ -24,6 +25,9 @@ class KinovaJoyTeleop:
         self.base = None
         self.router = None
         self.connection = None
+
+        # 对外暴露的 API 客户端（供 data_collector 等复用）
+        self.base_cyclic = None
         
         # 控制参数
         self.deadzone = 0.1      # 摇杆死区
@@ -49,6 +53,7 @@ class KinovaJoyTeleop:
         self.connection = utilities.DeviceConnection.createTcpConnection(Args(self.ip))
         self.router = self.connection.__enter__()
         self.base = BaseClient(self.router)
+        self.base_cyclic = BaseCyclicClient(self.router)
         print(f"✅ 已连接控制器: {self.joy.get_name()}")
         print("🚀 遥控模式启动！使用 Menu 键退出程序。\n")
 
@@ -62,6 +67,44 @@ class KinovaJoyTeleop:
             self.current_pose = [pose.x, pose.y, pose.z, pose.theta_x, pose.theta_y, pose.theta_z]
         except Exception:
             pass
+
+    def read_gamepad_state(self):
+        """读取手柄当前状态，返回 (axes, hat, buttons)。"""
+        pygame.event.pump()
+        a0 = self.apply_deadzone(self.joy.get_axis(0))
+        a1 = self.apply_deadzone(self.joy.get_axis(1))
+        a2 = (self.joy.get_axis(2) + 1) / 2.0
+        a3 = self.apply_deadzone(self.joy.get_axis(3))
+        a4 = self.apply_deadzone(self.joy.get_axis(4))
+        a5 = (self.joy.get_axis(5) + 1) / 2.0
+        hat = self.joy.get_hat(0)
+        buttons = {i: self.joy.get_button(i) for i in range(self.joy.get_numbuttons())}
+        return (a0, a1, a2, a3, a4, a5), hat, buttons
+
+    def send_twist(self, axes, hat):
+        """根据摇杆输入发送 Twist 指令。"""
+        a0, a1, a2, a3, a4, a5 = axes
+        speed = self.speed_limit
+        turn = self.turn_limit
+
+        command = Base_pb2.TwistCommand()
+        command.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+        command.duration = 0
+        command.twist.linear_x = -a1 * speed
+        command.twist.linear_y = -a0 * speed
+        command.twist.linear_z = (a5 - a2) * speed
+        command.twist.angular_x = a3 * turn
+        command.twist.angular_y = -a4 * turn
+        command.twist.angular_z = -hat[0] * turn
+
+        has_input = any([
+            abs(v) > 0.01
+            for v in [a0, a1, a5 - a2, a3, a4, hat[0]]
+        ])
+        if has_input:
+            self.base.SendTwistCommand(command)
+        else:
+            self.base.Stop()
 
     def display_status(self, axes, hat, gripper_status):
         """在终端实时刷新显示状态"""
@@ -78,55 +121,25 @@ class KinovaJoyTeleop:
         try:
             gripper_label = "IDLE"
             while True:
-                pygame.event.pump()
-                
-                # 检查 Menu 键退出
-                if self.joy.get_button(7):
+                axes, hat, buttons = self.read_gamepad_state()
+
+                if buttons.get(7):
                     print("\n\n停止程序...")
-                    break 
+                    break
 
-                # 1. 读取手柄数据
-                a0 = self.apply_deadzone(self.joy.get_axis(0)) # 左摇杆左右 (Y轴)
-                a1 = self.apply_deadzone(self.joy.get_axis(1)) # 左摇杆上下 (X轴)
-                a2 = (self.joy.get_axis(2) + 1) / 2.0          # LT下压
-                a3 = self.apply_deadzone(self.joy.get_axis(3)) # 右摇杆左右 (Roll)
-                a4 = self.apply_deadzone(self.joy.get_axis(4)) # 右摇杆上下 (Pitch)
-                a5 = (self.joy.get_axis(5) + 1) / 2.0          # RT下压
-                hat = self.joy.get_hat(0)                      # 十字键 (Yaw)
-
-                # 2. 构建 Twist 指令
-                command = Base_pb2.TwistCommand()
-                command.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
-                command.duration = 0
-
-                # --- 平移逻辑 ---
-                command.twist.linear_x = -a1 * self.speed_limit   # 上推为正(前)
-                command.twist.linear_y = -a0 * self.speed_limit   # 推左向右(镜像)
-                command.twist.linear_z = (a5 - a2) * self.speed_limit # RT升，LT降
-
-                # --- 旋转逻辑 ---
-                command.twist.angular_x = a3 * self.turn_limit    # Roll
-                command.twist.angular_y = -a4 * self.turn_limit   # Pitch
-                command.twist.angular_z = -hat[0] * self.turn_limit # Yaw (十字键左右)
-
-                # 3. 发送指令
-                has_input = any([a0, a1, abs(a5-a2)>0.05, a3, a4, hat[0]!=0])
-                if has_input:
-                    self.base.SendTwistCommand(command)
-                else:
-                    self.base.Stop()
+                self.send_twist(axes, hat)
 
                 # 4. 夹爪控制
-                if self.joy.get_button(0): # A键
+                if buttons.get(0):  # A
                     self.control_gripper(1.0)
                     gripper_label = "CLOSED"
-                elif self.joy.get_button(1): # B键
+                elif buttons.get(1):  # B
                     self.control_gripper(0.0)
                     gripper_label = "OPENED"
 
                 # 5. 获取反馈并显示
                 self.get_robot_pose()
-                self.display_status([a0, a1, a2, a3, a4, a5], hat, gripper_label)
+                self.display_status(axes, hat, gripper_label)
 
                 time.sleep(0.05) # 20Hz
 
