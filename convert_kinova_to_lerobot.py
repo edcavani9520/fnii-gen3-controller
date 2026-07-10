@@ -1,52 +1,93 @@
 #!/usr/bin/env python
-"""convert_kinova_to_lerobot.py — 将去模糊后的 Kinova Gen3 数据转换为 LeRobot 格式"""
+"""convert_kinova_to_lerobot.py — 将 Kinova Gen3 h5 原始数据转换为 LeRobot 格式
+
+用法:
+  python convert_kinova_to_lerobot.py
+  python convert_kinova_to_lerobot.py --h5 <path> --out <dataset_name>
+
+输出位置: lerobot_data/<dataset_name>/
+"""
 import sys
-import h5py
+import argparse
 import cv2
 import numpy as np
+import h5py
 from pathlib import Path
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, HF_LEROBOT_HOME
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+# ===== 输出目录配置 =====
+OUTPUT_ROOT = Path.home() / "lerobot_data"  # 所有 LeRobot 数据都放这里
+
+
+def load_episode_h5(h5_path: str):
+    """从 episode h5 提取关节角和 JPEG 帧"""
+    with h5py.File(h5_path, "r") as f:
+        rgb_bytes = f["camera/rgb"][:]             # (N,) object  ← JPEG bytes
+        cam_ts = f["camera/timestamp"][:].astype(np.float64)
+        joint_pos_deg = f["robot/joint_position"][:].astype(np.float64)  # (M, 7)
+        robot_ts = f["robot/timestamp"][:].astype(np.float64)
+
+    # 解码第一帧确认尺寸
+    sample = cv2.imdecode(rgb_bytes[0], cv2.IMREAD_COLOR)
+    assert sample is not None, "无法解码 JPEG 帧"
+    H, W = sample.shape[:2]
+
+    # 关节角 度 → 弧度
+    joint_pos = np.deg2rad(joint_pos_deg)
+
+    # 时间同步: camera 帧 → 最近的 robot 时间点
+    sync = np.searchsorted(robot_ts, cam_ts)
+    sync = np.clip(sync, 0, len(joint_pos) - 1)
+    for i in range(len(cam_ts)):
+        idx = sync[i]
+        if idx > 0 and abs(cam_ts[i] - robot_ts[idx - 1]) < abs(cam_ts[i] - robot_ts[idx]):
+            sync[i] = idx - 1
+
+    print(f"  [h5] {len(rgb_bytes)} 帧, {W}x{H}, {len(joint_pos)} 个 robot 时间点")
+    return rgb_bytes, joint_pos, sync, H, W
+
+
+def decode_jpeg(jpeg_bytes: bytes) -> np.ndarray:
+    """解码 JPEG 字节 → BGR uint8"""
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img  # (H, W, 3), BGR
 
 
 def main():
-    # ===== 路径配置 =====
-    h5_path = "/home/kinova-1/Robot-Kinematics-Guided-Spatially-Varying-Motion-Deblurrin/episode_0002.h5"
-    deblur_dir = "/home/kinova-1/Robot-Kinematics-Guided-Spatially-Varying-Motion-Deblurrin/deblur_output/episode_0002/deblurred"
-    repo_id = "kinova_gen3_deblur_v1"  # 数据集名称，后面训练会用
+    parser = argparse.ArgumentParser(description="Kinova Gen3 h5 → LeRobot 格式")
+    parser.add_argument("--h5", default="episode_0002.h5",
+                        help="输入 h5 文件路径")
+    parser.add_argument("--out", default="kinova_gen3_deblur_v1",
+                        help="数据集名称 (输出到 lerobot_data/<name>/")
+    parser.add_argument("--task", default="push the cup to the right",
+                        help="语言指令")
+    args = parser.parse_args()
 
-    # ===== 检查输入文件 =====
-    if not Path(h5_path).exists():
-        print(f"❌ h5 文件不存在: {h5_path}")
-        sys.exit(1)
+    h5_path = Path(args.h5)
+    if not h5_path.exists():
+        # 尝试在 deblurrin 项目目录下找
+        alt = Path.home() / "Robot-Kinematics-Guided-Spatially-Varying-Motion-Deblurrin" / args.h5
+        if alt.exists():
+            h5_path = alt
+        else:
+            print(f"❌ 找不到 h5 文件: {args.h5}")
+            sys.exit(1)
 
-    deblur_dir = Path(deblur_dir)
-    if not deblur_dir.exists():
-        print(f"❌ 去模糊帧目录不存在: {deblur_dir}")
-        sys.exit(1)
+    repo_id = args.out
+    output_dir = OUTPUT_ROOT / repo_id
+    print(f"📥 输入: {h5_path}")
+    print(f"📦 输出: {output_dir}")
 
-    print(f"📂 输入: {h5_path}")
-    print(f"📸 去模糊帧: {deblur_dir}/")
+    # 1. 加载 h5
+    rgb_bytes, joint_pos, sync_indices, H, W = load_episode_h5(str(h5_path))
+    num_frames = len(rgb_bytes)
+    print(f"   有效帧: {num_frames}")
 
-    # ===== 1. 加载 h5 =====
-    print("📥 加载 h5...")
-    h5 = h5py.File(h5_path, "r")
-    joint_pos = np.deg2rad(h5["robot/joint_position"][:])  # (605, 7) 度 → 弧度
-    cam_ts = h5["camera/timestamp"][:]                     # (368,)
-    robot_ts = h5["robot/timestamp"][:]                    # (605,)
-    num_frames = len(cam_ts)
-    print(f"   关节数据: {joint_pos.shape[0]} 个时间点, 共 {num_frames} 帧")
-
-    # 时间同步
-    sync_indices = np.searchsorted(robot_ts, cam_ts)
-    sync_indices = np.clip(sync_indices, 0, len(joint_pos) - 1)
-
-    # ===== 2. 创建 LeRobot dataset =====
-    print("📦 创建 LeRobot 数据集...")
-    output_path = Path(HF_LEROBOT_HOME) / repo_id
-    print(f"   输出路径: {output_path}")
-
+    # 2. 创建 LeRobot 数据集（用自定义输出路径）
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
+        root=OUTPUT_ROOT,  # ← 指定根目录，不依赖 HF_LEROBOT_HOME
         robot_type="kinova_gen3",
         fps=10,
         features={
@@ -73,27 +114,18 @@ def main():
         },
     )
 
-    # ===== 3. 逐帧添加 =====
+    # 3. 逐帧添加
     print("📝 写入帧...")
     for i in range(num_frames):
-        # 读取去模糊帧
-        img_path = deblur_dir / f"step_{i:04d}.jpg"
-        if not img_path.exists():
-            print(f"   ⚠️ 第 {i} 帧图片不存在: {img_path}")
-            continue
-
-        img_bgr = cv2.imread(str(img_path))
+        img_bgr = decode_jpeg(rgb_bytes[i])
         if img_bgr is None:
-            print(f"   ⚠️ 第 {i} 帧无法读取")
+            print(f"   ⚠️ 跳过第 {i} 帧: 解码失败")
             continue
-
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         img_rgb = cv2.resize(img_rgb, (224, 224))
 
         ri = sync_indices[i]
         state = joint_pos[ri].astype(np.float32)
-
-        # action: 下一帧的 joint position（如果是最后一帧则用自己）
         next_idx = min(ri + 1, len(joint_pos) - 1)
         action = joint_pos[next_idx].astype(np.float32)
 
@@ -102,20 +134,20 @@ def main():
             "wrist_image": img_rgb.copy(),
             "state": state,
             "actions": action,
-            "task": "push the cup to the right",
+            "task": args.task,
         })
 
         if (i + 1) % 50 == 0:
             print(f"   {i + 1}/{num_frames}")
 
-    # ===== 4. 保存 =====
-    print("💾 保存 episode...")
+    # 4. 保存
     dataset.save_episode()
     print(f"\n✅ 转换完成!")
     print(f"   episodes: {dataset.num_episodes}")
     print(f"   frames:   {dataset.num_frames}")
-    print(f"   保存路径: {output_path}")
-    print(f"\n下一步: 在 openpi 训练时使用 repo_id='{repo_id}'")
+    print(f"   保存路径: {output_dir}")
+    print(f"\n下一步: 在 openpi 中训练时使用 repo_id='{repo_id}'")
+    print(f"       数据路径: {output_dir}")
 
 
 if __name__ == "__main__":
