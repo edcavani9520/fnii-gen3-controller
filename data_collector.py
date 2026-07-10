@@ -28,7 +28,7 @@ T_sync = camera 帧数（对齐到 action_hz，默认 25Hz）。
   右摇杆        → Roll / Pitch
   十字键左右    → Yaw
   A / B         → 夹爪关/开
-  Y             → 开始/停止 录制 (toggle)
+  Y             → 开始录制；再按 Y 保存停止，按 X 删除
   Menu(按钮7)   → 退出程序
 
 用法:
@@ -94,6 +94,7 @@ class Config:
 
     # ---- 录制控制 ----
     record_button: int = 3        # Y
+    delete_button: int = 2        # X → 停止并删除视频
     exit_button: int = 7          # Menu
 
     # ---- 图像质量 ----
@@ -150,6 +151,7 @@ class KinovaTrainDataCollector:
 
         # ---- 边沿检测 ----
         self._prev_y = False
+        self._prev_x = False
         self._gripper_label = "IDLE"
         self._last_gripper_cmd = 0.0   # 上次夹爪命令
 
@@ -554,16 +556,27 @@ class KinovaTrainDataCollector:
                     print("\n⏹ 退出程序...")
                     break
 
-                # 录制 toggle
+                # 录制控制：Y 开始 / Y 保存 / X 删除
                 y_pressed = bool(buttons.get(self.cfg.record_button))
+                x_pressed = bool(buttons.get(self.cfg.delete_button))
+
                 if y_pressed and not self._prev_y:
-                    if self._recording:
-                        self._stop_recording()
-                        rec_label = "■ IDLE"
-                    else:
+                    if not self._recording:
                         self._start_recording()
                         rec_label = "● REC"
+                    else:
+                        # Y 再次按下 → 停止并保存
+                        self._stop_recording()
+                        rec_label = "■ IDLE"
+
+                if x_pressed and not self._prev_x:
+                    if self._recording:
+                        # X 按下 → 停止并删除
+                        self._stop_recording(delete=True)
+                        rec_label = "■ IDLE"
+
                 self._prev_y = y_pressed
+                self._prev_x = x_pressed
 
                 # 夹爪
                 if buttons.get(0):
@@ -637,9 +650,17 @@ class KinovaTrainDataCollector:
         self._open_episode(self._episode)
         self._recording = True
 
-    def _stop_recording(self):
+    def _stop_recording(self, delete=False):
         self._recording = False
-        self._close_episode()
+        if delete:
+            # 保存文件名后关闭再删除
+            fname = self._hdf5_file.filename if self._hdf5_file is not None else None
+            self._close_episode()
+            if fname and os.path.exists(fname):
+                os.remove(fname)
+                print(f"Deleted episode {self._episode:04d}: {fname}")
+        else:
+            self._close_episode()
 
     def _print_status(self, axes, hat, rec_label):
         a0, a1, _, a3, a4, _ = axes
@@ -711,7 +732,7 @@ if __name__ == "__main__":
     print("  控制映射:")
     print("    左摇杆 → XY 平移    右摇杆 → Roll / Pitch")
     print("    LT/RT  → Z 轴升降   十字键 → Yaw")
-    print("    A 关夹爪  B 开夹爪   Y → 开始/停止录制")
+    print("    A 关夹爪  B 开夹爪   Y 开始录制 / Y 保存 / X 删除")
     print("    Menu 退出")
     print(f"  输出: ~/kinova_data/train_data_<timestamp>/episode_XXXX.h5")
 

@@ -47,6 +47,7 @@ class KinovaJoyTeleop:
         
         # 内部状态记录
         self.current_pose = [0.0] * 6 # x, y, z, theta_x, theta_y, theta_z
+        self._prev_lb = False
 
     def connect(self):
         """建立机器人连接"""
@@ -140,9 +141,15 @@ class KinovaJoyTeleop:
                     self.control_gripper(0.0)
                     gripper_label = "OPENED"
 
-                # 5. 获取反馈并显示
+                # 5. LB → 回到原点
+                if buttons.get(4) and not self._prev_lb:
+                    self.go_to_home_pose()
+
+                # 6. 获取反馈并显示
                 self.get_robot_pose()
                 self.display_status(axes, hat, gripper_label)
+
+                self._prev_lb = bool(buttons.get(4))
 
                 time.sleep(0.05) # 20Hz
 
@@ -165,6 +172,32 @@ class KinovaJoyTeleop:
             self.base.SendGripperCommand(gripper_command)
         except:
             pass
+
+    def go_to_home_pose(self):
+        """移动到预设原点位姿并打开夹爪"""
+        print("\n回家...")
+        self.base.Stop()
+        time.sleep(0.1)
+
+        action = Base_pb2.Action()
+        action.name = "Home"
+        action.application_data = ""
+
+        action.reach_pose.target_pose.x = 0.131
+        action.reach_pose.target_pose.y = -0.004
+        action.reach_pose.target_pose.z = 0.21
+        action.reach_pose.target_pose.theta_x = 176.39
+        action.reach_pose.target_pose.theta_y = 0.923
+        action.reach_pose.target_pose.theta_z = 90.271
+
+        try:
+            self.base.ExecuteAction(action)
+            self.control_gripper(0.0)
+            print("OK")
+        except Exception as e:
+            print(f"回到原点失败: {e}")
+
+        self.get_robot_pose()
 
 if __name__ == "__main__":
     teleop = KinovaJoyTeleop()
