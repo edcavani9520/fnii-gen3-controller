@@ -1,4 +1,7 @@
 import sys
+import os
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
 import time
 
 # 动态添加 utilities 路径

@@ -1,4 +1,7 @@
 import sys
+import os
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
 import time
 from kortex_api.autogen.client_stubs.NetworkConfigClientRpc import NetworkConfigClient
 from kortex_api.autogen.messages import NetworkConfig_pb2

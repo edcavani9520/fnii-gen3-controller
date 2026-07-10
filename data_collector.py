@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
 """
-Kinova Gen3 数据采集脚本
-=========================
-基于 gamepad 遥操作，同步录制：
-  - 机器人状态（关节角/速度/力矩、末端位姿/捻度/受力、夹爪、IMU 等）
-  - 摄像头 RGB 图像
+Kinova Gen3 数据采集脚本 - 训练用格式输出
+=============================================
+基于 gamepad 遥操作，同步录制 obs/action 对，直接可用作 VLA 行为克隆训练。
 
-输出：HDF5 文件，按 episode 组织。
+输出格式（每 episode 一个 HDF5）:
+  obs/
+    camera_0      (T_sync,) uint8 (vlen)       — JPEG-encoded RGB 图像（对齐到动作步频）
+    joint_pos     (T_sync, 7) float64       — 关节位置
+    joint_vel     (T_sync, 7) float64       — 关节速度
+    eef_pose      (T_sync, 6) float64       — 末端位姿 [x,y,z,θx,θy,θz]
+    gripper_pos   (T_sync, 1) float64       — 夹爪开合度 [0=开, 1=关]
+  action/
+    eef_delta     (T_sync, 6) float64       — 末端 delta [dx,dy,dz,dθx,dθy,dθz]
+    gripper       (T_sync, 1) float64       — 夹爪动作 [0=不动, -1=开, +1=关]
+    raw_twist     (T_sync, 6) float64       — 原始速度指令 [vx,vy,vz,wx,wy,wz]
+  timestamps      (T_sync,) float64         — 每步时间戳
+  meta/  (attrs)
+    episode, start_time, robot_ip, camera_fps, action_hz, ...
 
-控制映射（与 gamepad_control_obs.py 一致）：
+T_sync = camera 帧数（对齐到 action_hz，默认 25Hz）。
+每个 step = (obs_t, action_t) 对, action_t 是从 obs_t 到 obs_{t+1} 的指令。
+
+控制映射（与 gamepad_control.py 一致）：
   左摇杆        → XY 平移
   LT/RT         → Z 轴升降
   右摇杆        → Roll / Pitch
@@ -23,11 +37,16 @@ Kinova Gen3 数据采集脚本
 
 import sys
 import os
+
+# 兼容 protobuf 4.x + 旧版 kortex _pb2 桩代码
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
 import time
 import threading
 import queue
 import datetime
 from typing import Optional
+from dataclasses import dataclass, field
 
 import numpy as np
 import pygame
@@ -40,50 +59,65 @@ sys.path.insert(0, os.path.join(
     "Kinova_kortex2_Gen3_G3L", "api_python", "examples"
 ))
 import utilities
-
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
 from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.messages import Base_pb2, BaseCyclic_pb2
 
 
 # ======================================================================
-#  配置（可根据需要修改）
+#  配置
 # ======================================================================
+@dataclass
 class Config:
     # ---- 机械臂 ----
-    robot_ip = "192.168.8.10"
-    speed_limit = 0.20      # m/s
-    turn_limit = 20.0       # °/s
-    deadzone = 0.1
+    robot_ip: str = "192.168.8.10"
+    speed_limit: float = 0.20      # m/s
+    turn_limit: float = 20.0       # °/s
+    deadzone: float = 0.1
 
     # ---- 摄像头 ----
-    camera_id = 0           # /dev/video0
-    camera_width = 640
-    camera_height = 480
-    camera_fps = 25
+    camera_id: int = 0
+    camera_width: int = 640
+    camera_height: int = 480
+    camera_fps: int = 25
 
     # ---- 采集 ----
-    output_root = os.path.expanduser("~/kinova_data")     # 数据根目录
-    robot_sample_hz = 100                                  # 机器人状态采样频率 (与反馈频率一致)
-    camera_sample_hz = 25                                  # 相机采样频率
-    hdf5_compression = "gzip"                              # HDF5 压缩算法
-    hdf5_compression_opts = 4                              # 压缩等级
+    output_root: str = os.path.expanduser("~/kinova_data")
+    robot_sample_hz: int = 100    # 机器人状态采样频率
+    action_hz: int = 25           # 输出 obs/action 对的频率（与 camera 对齐）
+    hdf5_compression: str = "gzip"
+    hdf5_compression_opts: int = 4
+
+    # ---- 任务描述（VLA language instruction）----
+    task: str = ""                     # 命令行通过 --task 指定，为空则在录制时交互输入
+    task_id: int = 0                   # 任务编号
 
     # ---- 录制控制 ----
-    record_button = 3       # Y 按钮 toggle 录制
-    exit_button = 7         # Menu 退出
+    record_button: int = 3        # Y
+    exit_button: int = 7          # Menu
+
+    # ---- 图像质量 ----
+    jpeg_quality: int = 95        # 存储用 JPEG 压缩，加载时解压为 uint8
 
 
 # ======================================================================
-#  数据采集器
+#  数据采集器 — 输出训练用格式
 # ======================================================================
-class KinovaDataCollector:
-    """同步采集 Kinova 机械臂状态 + 摄像头图像，保存为 HDF5。"""
+class KinovaTrainDataCollector:
+    """
+    采集（obs, action）对用于 VLA / 行为克隆训练。
+
+    设计要点：
+      - robot 状态 @ 100Hz, camera @ 25Hz, 动作 @ 25Hz
+      - 保存时以 camera 时间戳为锚点，对齐最近的 robot 状态和动作
+      - 输出 HDF5: obs/ + action/ 分组，每个时间步一对
+      - 自动计算 eef_delta 和 gripper 动作
+    """
 
     def __init__(self, cfg: Config = None):
         self.cfg = cfg or Config()
 
-        # ---- 机械臂连接 ----
+        # ---- Kinova 连接 ----
         self.base: Optional[BaseClient] = None
         self.base_cyclic: Optional[BaseCyclicClient] = None
         self.router = None
@@ -93,29 +127,34 @@ class KinovaDataCollector:
         pygame.init()
         pygame.joystick.init()
         if pygame.joystick.get_count() == 0:
-            raise RuntimeError("❌ 未检测到手柄，请连接后重试。")
+            raise RuntimeError("❌ 未检测到手柄")
         self.joy = pygame.joystick.Joystick(0)
         self.joy.init()
 
         # ---- 摄像头 ----
         self.cap: Optional[cv2.VideoCapture] = None
 
-        # ---- 采集缓冲 ----
-        self._robot_queue: queue.Queue = queue.Queue(maxsize=5000)
-        self._camera_queue: queue.Queue = queue.Queue(maxsize=2000)
+        # ===== 三路缓冲 =====
+        self._robot_q: queue.Queue = queue.Queue(maxsize=5000)
+        self._camera_q: queue.Queue = queue.Queue(maxsize=2000)
+        self._action_q: queue.Queue = queue.Queue(maxsize=5000)
+
+        # ---- 录制状态 ----
         self._recording = False
         self._episode = 0
+        self._task_counter = 0          # 自动递增任务编号
         self._output_dir = ""
         self._hdf5_file: Optional[h5py.File] = None
         self._running = threading.Event()
         self._running.set()
 
-        # ---- 手柄按钮映射缓存 ----
-        self._buttons = {}
-        self._prev_y = False  # 边沿检测
-
-        # ---- 夹爪状态 ----
+        # ---- 边沿检测 ----
+        self._prev_y = False
         self._gripper_label = "IDLE"
+        self._last_gripper_cmd = 0.0   # 上次夹爪命令
+
+        # ---- 动作缓冲（用于计算 delta） ----
+        self._prev_pose = None  # 前一步的末端位姿
 
         print(f"🎮 手柄已连接: {self.joy.get_name()}")
 
@@ -123,7 +162,6 @@ class KinovaDataCollector:
     #  连接
     # ================================================================
     def connect(self):
-        """连接 Kinova 机械臂。"""
         class Args:
             def __init__(self, ip):
                 self.ip = ip
@@ -138,14 +176,12 @@ class KinovaDataCollector:
         print(f"✅ 已连接 Kinova @ {self.cfg.robot_ip}")
 
     def connect_camera(self):
-        """打开摄像头。"""
         self.cap = cv2.VideoCapture(self.cfg.camera_id)
         if not self.cap.isOpened():
             raise RuntimeError(f"❌ 无法打开摄像头 /dev/video{self.cfg.camera_id}")
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.camera_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.camera_height)
         self.cap.set(cv2.CAP_PROP_FPS, self.cfg.camera_fps)
-        # 实际读一帧确认
         ret, frame = self.cap.read()
         if not ret:
             raise RuntimeError("❌ 摄像头无数据")
@@ -153,28 +189,42 @@ class KinovaDataCollector:
         print(f"📷 摄像头已打开: {actual_w}x{actual_h} @ {self.cfg.camera_fps} FPS")
 
     # ================================================================
-    #  后台采集线程
+    #  后台采集线程（三路并行）
     # ================================================================
+
     def _robot_poll_thread(self):
-        """100Hz 机器人状态轮询线程。"""
-        hz = self.cfg.robot_sample_hz
-        period = 1.0 / hz
+        """100Hz 机器人状态 + 动作（手柄指令）。"""
+        period = 1.0 / self.cfg.robot_sample_hz
         while self._running.is_set():
-            t_start = time.perf_counter()
+            t0 = time.perf_counter()
             try:
                 feedback = self.base_cyclic.RefreshFeedback()
                 ts = time.time()
-                snapshot = self._snapshot_robot_state(feedback, ts)
-                self._robot_queue.put_nowait(snapshot)
+                obs = self._snapshot_robot_state(feedback, ts)
+                self._robot_q.put_nowait(obs)
             except Exception:
                 pass
-            elapsed = time.perf_counter() - t_start
-            sleep = max(0.0, period - elapsed)
-            time.sleep(sleep)
+            elapsed = time.perf_counter() - t0
+            time.sleep(max(0.0, period - elapsed))
+
+    def _action_poll_thread(self):
+        """记录手柄指令（动作），频率对齐 robot 采样。"""
+        period = 1.0 / self.cfg.robot_sample_hz
+        while self._running.is_set():
+            t0 = time.perf_counter()
+            try:
+                axes, hat, buttons = self._read_gamepad()
+                ts = time.time()
+                action = self._snapshot_action(axes, hat, buttons, ts)
+                self._action_q.put_nowait(action)
+            except Exception:
+                pass
+            elapsed = time.perf_counter() - t0
+            time.sleep(max(0.0, period - elapsed))
 
     def _camera_capture_thread(self):
-        """摄像机采集线程（以相机原生帧率抓取，采样到 ~25Hz）。"""
-        min_interval = 1.0 / self.cfg.camera_sample_hz
+        """摄像头采集线程（原生帧率）。"""
+        min_interval = 1.0 / self.cfg.camera_fps
         last_cap = 0.0
         while self._running.is_set():
             ret, frame = self.cap.read()
@@ -182,366 +232,329 @@ class KinovaDataCollector:
                 self._running.clear()
                 break
             now = time.time()
-            # 限流
             if now - last_cap >= min_interval:
                 last_cap = now
-                self._camera_queue.put_nowait({
+                self._camera_q.put_nowait({
                     "timestamp": now,
                     "frame": frame.copy(),
                 })
-            else:
-                # 丢帧 — 摄像头通常比需求快
-                pass
-            # 不要忙等，稍微休息一下减少 CPU
             time.sleep(0.001)
+
+    # ================================================================
+    #  快照函数
+    # ================================================================
 
     @staticmethod
     def _snapshot_robot_state(feedback, timestamp: float) -> dict:
-        """将 Kortex Cyclic 反馈打包为 dict。"""
         b = feedback.base
         inter = feedback.interconnect
-
-        # 关节数据
         n_act = len(feedback.actuators)
         joint_pos = np.zeros(n_act)
         joint_vel = np.zeros(n_act)
         joint_torque = np.zeros(n_act)
-        joint_current = np.zeros(n_act)
-        joint_voltage = np.zeros(n_act)
-        joint_temp = np.zeros(n_act)
         for i, act in enumerate(feedback.actuators):
             joint_pos[i] = act.position
             joint_vel[i] = act.velocity
             joint_torque[i] = act.torque
-            joint_current[i] = act.current_motor
-            joint_voltage[i] = act.voltage
-            joint_temp[i] = act.temperature_core
-
-        # 夹爪
         gripper_motors = inter.gripper_feedback.motor
         gripper_pos = float(gripper_motors[0].position) if gripper_motors else 0.0
-
         return {
             "timestamp": timestamp,
-            # 末端位姿
-            "tool_pose": np.array([
+            "eef_pose": np.array([
                 b.tool_pose_x, b.tool_pose_y, b.tool_pose_z,
                 b.tool_pose_theta_x, b.tool_pose_theta_y, b.tool_pose_theta_z
             ], dtype=np.float64),
-            "tool_pose_cmd": np.array([
-                b.commanded_tool_pose_x, b.commanded_tool_pose_y, b.commanded_tool_pose_z,
-                b.commanded_tool_pose_theta_x, b.commanded_tool_pose_theta_y,
-                b.commanded_tool_pose_theta_z
-            ], dtype=np.float64),
-            # 末端捻度（速度）
-            "tool_twist": np.array([
-                b.tool_twist_linear_x, b.tool_twist_linear_y, b.tool_twist_linear_z,
-                b.tool_twist_angular_x, b.tool_twist_angular_y, b.tool_twist_angular_z
-            ], dtype=np.float64),
-            # 末端外力/力矩
-            "tool_wrench": np.array([
-                b.tool_external_wrench_force_x, b.tool_external_wrench_force_y,
-                b.tool_external_wrench_force_z,
-                b.tool_external_wrench_torque_x, b.tool_external_wrench_torque_y,
-                b.tool_external_wrench_torque_z
-            ], dtype=np.float64),
-            # 关节
-            "joint_position": joint_pos,
-            "joint_velocity": joint_vel,
+            "joint_pos": joint_pos,
+            "joint_vel": joint_vel,
             "joint_torque": joint_torque,
-            "joint_current": joint_current,
-            "joint_voltage": joint_voltage,
-            "joint_temperature": joint_temp,
-            # 夹爪
-            "gripper_position": gripper_pos,
-            # IMU (基座)
-            "base_imu_accel": np.array([
-                b.imu_acceleration_x, b.imu_acceleration_y, b.imu_acceleration_z
-            ], dtype=np.float64),
-            "base_imu_gyro": np.array([
-                b.imu_angular_velocity_x, b.imu_angular_velocity_y, b.imu_angular_velocity_z
-            ], dtype=np.float64),
-            # 电源
-            "arm_voltage": b.arm_voltage,
-            "arm_current": b.arm_current,
-            "temperature_cpu": b.temperature_cpu,
-            "temperature_ambient": b.temperature_ambient,
+            "gripper_pos": gripper_pos,
         }
 
-    # ================================================================
-    #  手柄输入
-    # ================================================================
-    def apply_deadzone(self, v: float) -> float:
-        return v if abs(v) > self.cfg.deadzone else 0.0
-
-    def read_gamepad(self) -> tuple:
-        """读取手柄当前状态，返回 (axes, hat, buttons)。"""
+    def _read_gamepad(self):
         pygame.event.pump()
-        a0 = self.apply_deadzone(self.joy.get_axis(0))
-        a1 = self.apply_deadzone(self.joy.get_axis(1))
+        a0 = self._deadzone(self.joy.get_axis(0))
+        a1 = self._deadzone(self.joy.get_axis(1))
         a2 = (self.joy.get_axis(2) + 1) / 2.0
-        a3 = self.apply_deadzone(self.joy.get_axis(3))
-        a4 = self.apply_deadzone(self.joy.get_axis(4))
+        a3 = self._deadzone(self.joy.get_axis(3))
+        a4 = self._deadzone(self.joy.get_axis(4))
         a5 = (self.joy.get_axis(5) + 1) / 2.0
         hat = self.joy.get_hat(0)
         buttons = {i: self.joy.get_button(i) for i in range(self.joy.get_numbuttons())}
         return (a0, a1, a2, a3, a4, a5), hat, buttons
 
-    def send_twist(self, axes, hat):
-        """发送 Twist 指令。"""
-        a0, a1, a2, a3, a4, a5 = axes
-        command = Base_pb2.TwistCommand()
-        command.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
-        command.duration = 0
-        command.twist.linear_x = -a1 * self.cfg.speed_limit
-        command.twist.linear_y = -a0 * self.cfg.speed_limit
-        command.twist.linear_z = (a5 - a2) * self.cfg.speed_limit
-        command.twist.angular_x = a3 * self.cfg.turn_limit
-        command.twist.angular_y = -a4 * self.cfg.turn_limit
-        command.twist.angular_z = -hat[0] * self.cfg.turn_limit
+    def _deadzone(self, v):
+        return v if abs(v) > self.cfg.deadzone else 0.0
 
-        has_input = any([
-            abs(v) > 0.01
-            for v in [a0, a1, a5 - a2, a3, a4, hat[0]]
-        ])
+    def _snapshot_action(self, axes, hat, buttons, timestamp: float) -> dict:
+        """打包当前手柄指令为动作向量。"""
+        a0, a1, a2, a3, a4, a5 = axes
+        # Twist 指令 [vx, vy, vz, wx, wy, wz]
+        twist = np.array([
+            -a1 * self.cfg.speed_limit,
+            -a0 * self.cfg.speed_limit,
+            (a5 - a2) * self.cfg.speed_limit,
+            a3 * self.cfg.turn_limit,
+            -a4 * self.cfg.turn_limit,
+            -hat[0] * self.cfg.turn_limit,
+        ], dtype=np.float64)
+
+        # 夹爪指令
+        gripper_cmd = self._last_gripper_cmd
+        if buttons.get(0):  # A → 关闭
+            gripper_cmd = 1.0
+        elif buttons.get(1):  # B → 打开
+            gripper_cmd = 0.0
+        self._last_gripper_cmd = gripper_cmd
+
+        return {
+            "timestamp": timestamp,
+            "twist": twist,
+            "gripper_cmd": np.array([gripper_cmd], dtype=np.float64),
+        }
+
+    # ================================================================
+    #  手柄控制（主循环调用）
+    # ================================================================
+
+    def _send_twist_from_action(self, action_dict: dict):
+        """从动作字典中提取 twist 并发送给机器人。"""
+        twist = action_dict["twist"]
+        cmd = Base_pb2.TwistCommand()
+        cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+        cmd.duration = 0
+        cmd.twist.linear_x = twist[0]
+        cmd.twist.linear_y = twist[1]
+        cmd.twist.linear_z = twist[2]
+        cmd.twist.angular_x = twist[3]
+        cmd.twist.angular_y = twist[4]
+        cmd.twist.angular_z = twist[5]
+
+        has_input = np.any(np.abs(twist) > 0.001)
         if has_input:
-            self.base.SendTwistCommand(command)
+            self.base.SendTwistCommand(cmd)
         else:
             self.base.Stop()
 
-    def control_gripper(self, pos: float):
-        """pos: 0.0 全开, 1.0 全关"""
+    def _send_gripper(self, pos: float):
         try:
             cmd = Base_pb2.GripperCommand()
             cmd.mode = Base_pb2.GRIPPER_POSITION
             finger = cmd.gripper.finger.add()
             finger.finger_identifier = 1
-            finger.value = pos
+            finger.value = float(pos)
             self.base.SendGripperCommand(cmd)
         except Exception:
             pass
 
     # ================================================================
-    #  HDF5 文件管理
+    #  HDF5 输出 — 训练用格式
     # ================================================================
+
     def _open_episode(self, episode: int):
-        """创建新 episode 的 HDF5 文件。"""
         self._ensure_output_dir()
         fname = os.path.join(self._output_dir, f"episode_{episode:04d}.h5")
         f = h5py.File(fname, "w")
 
-        # --- 创建数据集（可扩展） ---
-        # 机器人状态：初始为无限可扩展
-        f.create_dataset(
-            "robot/timestamp", shape=(0,), maxshape=(None,), dtype=np.float64,
+        # === obs 分组 ===
+        grp_obs = f.create_group("obs")
+        # camera_0: JPEG-encoded RGB frames (variable-length)
+        grp_obs.create_dataset(
+            "camera_0", shape=(0,), maxshape=(None,),
+            dtype=h5py.special_dtype(vlen=np.dtype('uint8')),
             compression=self.cfg.hdf5_compression,
             compression_opts=self.cfg.hdf5_compression_opts,
         )
-        f.create_dataset(
-            "robot/tool_pose", shape=(0, 6), maxshape=(None, 6), dtype=np.float64,
-            compression=self.cfg.hdf5_compression,
-        )
-        f.create_dataset(
-            "robot/tool_pose_cmd", shape=(0, 6), maxshape=(None, 6), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/tool_twist", shape=(0, 6), maxshape=(None, 6), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/tool_wrench", shape=(0, 6), maxshape=(None, 6), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/joint_position", shape=(0, 7), maxshape=(None, 7), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/joint_velocity", shape=(0, 7), maxshape=(None, 7), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/joint_torque", shape=(0, 7), maxshape=(None, 7), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/joint_current", shape=(0, 7), maxshape=(None, 7), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/joint_voltage", shape=(0, 7), maxshape=(None, 7), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/joint_temperature", shape=(0, 7), maxshape=(None, 7), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/gripper_position", shape=(0,), maxshape=(None,), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/base_imu_accel", shape=(0, 3), maxshape=(None, 3), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/base_imu_gyro", shape=(0, 3), maxshape=(None, 3), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/arm_voltage", shape=(0,), maxshape=(None,), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/arm_current", shape=(0,), maxshape=(None,), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/temperature_cpu", shape=(0,), maxshape=(None,), dtype=np.float64,
-        )
-        f.create_dataset(
-            "robot/temperature_ambient", shape=(0,), maxshape=(None,), dtype=np.float64,
-        )
+        for name, dim in [("joint_pos", 7), ("joint_vel", 7),
+                          ("eef_pose", 6), ("gripper_pos", 1)]:
+            grp_obs.create_dataset(
+                name, shape=(0, dim), maxshape=(None, dim), dtype=np.float64,
+                compression=self.cfg.hdf5_compression,
+            )
 
-        # --- 图像 ---
-        f.create_dataset(
-            "camera/timestamp", shape=(0,), maxshape=(None,), dtype=np.float64,
-        )
-        # 用 uint8 存储 JPEG 压缩后的图像（节省空间）
-        f.create_dataset(
-            "camera/rgb", shape=(0,), maxshape=(None,), dtype=h5py.special_dtype(vlen=np.dtype('uint8')),
-            compression=self.cfg.hdf5_compression,
-            compression_opts=self.cfg.hdf5_compression_opts,
-        )
+        # === action 分组 ===
+        grp_act = f.create_group("action")
+        for name, dim in [("eef_delta", 6), ("gripper", 1), ("raw_twist", 6)]:
+            grp_act.create_dataset(
+                name, shape=(0, dim), maxshape=(None, dim), dtype=np.float64,
+                compression=self.cfg.hdf5_compression,
+            )
 
-        # --- 元数据 ---
+        # === 时间戳 ===
+        f.create_dataset("timestamps", shape=(0,), maxshape=(None,), dtype=np.float64)
+
+        # === VLA 元数据（language instruction, task info） ===
+        task_desc = self.cfg.task or "unnamed"
         f.attrs["episode"] = episode
+        f.attrs["task/id"] = self.cfg.task_id
+        f.attrs["task/language_instruction"] = task_desc
+        f.attrs["dataset_name"] = "kinova_gen3_teleop"
+        f.attrs["robot_type"] = "Kinova Gen3"
+        f.attrs["control_mode"] = "twist_velocity"
+        f.attrs["camera_names"] = "['cam_0']"
         f.attrs["start_time"] = time.time()
         f.attrs["robot_ip"] = self.cfg.robot_ip
         f.attrs["speed_limit"] = self.cfg.speed_limit
         f.attrs["turn_limit"] = self.cfg.turn_limit
         f.attrs["camera_fps"] = self.cfg.camera_fps
+        f.attrs["camera_width"] = self.cfg.camera_width
+        f.attrs["camera_height"] = self.cfg.camera_height
+        f.attrs["action_hz"] = self.cfg.action_hz
         f.attrs["robot_sample_hz"] = self.cfg.robot_sample_hz
-        f.attrs["camera_sample_hz"] = self.cfg.camera_sample_hz
+        f.attrs["jpeg_quality"] = self.cfg.jpeg_quality
+        f.attrs["date_collected"] = datetime.datetime.now().isoformat()
 
         self._hdf5_file = f
         print(f"\n📝 开始录制 → {fname}")
+        print(f"   🏷️  task: {task_desc}")
 
-    def _flush_episode(self):
-        """将缓冲数据写入 HDF5。"""
+        # 重置 delta 计算缓存
+        self._prev_pose = None
+
+    def _sync_and_write(self):
+        """
+        核心对齐函数：以 camera 时间戳为锚点，同步 robot 状态和动作，
+        计算 eef_delta，写入 HDF5。
+        """
         if self._hdf5_file is None:
             return
 
         f = self._hdf5_file
 
-        # --- 写机器人数据 ---
-        robot_items = []
-        while not self._robot_queue.empty():
-            try:
-                robot_items.append(self._robot_queue.get_nowait())
-            except queue.Empty:
-                break
+        # 1. drain 所有缓冲
+        robot_items = self._drain(self._robot_q)
+        camera_items = self._drain(self._camera_q)
+        action_items = self._drain(self._action_q)
 
-        if robot_items:
-            n = len(robot_items)
-            keys = [
-                ("robot/timestamp", "timestamp"),
-                ("robot/tool_pose", "tool_pose"),
-                ("robot/tool_pose_cmd", "tool_pose_cmd"),
-                ("robot/tool_twist", "tool_twist"),
-                ("robot/tool_wrench", "tool_wrench"),
-                ("robot/joint_position", "joint_position"),
-                ("robot/joint_velocity", "joint_velocity"),
-                ("robot/joint_torque", "joint_torque"),
-                ("robot/joint_current", "joint_current"),
-                ("robot/joint_voltage", "joint_voltage"),
-                ("robot/joint_temperature", "joint_temperature"),
-                ("robot/gripper_position", "gripper_position"),
-                ("robot/base_imu_accel", "base_imu_accel"),
-                ("robot/base_imu_gyro", "base_imu_gyro"),
-                ("robot/arm_voltage", "arm_voltage"),
-                ("robot/arm_current", "arm_current"),
-                ("robot/temperature_cpu", "temperature_cpu"),
-                ("robot/temperature_ambient", "temperature_ambient"),
-            ]
-            for h5path, key in keys:
-                data = np.array([r[key] for r in robot_items])
-                ds = f[h5path]
-                cur = ds.shape[0]
-                ds.resize((cur + n, *ds.shape[1:]))
-                ds[cur:] = data
+        if not camera_items or not robot_items or not action_items:
+            return
 
-        # --- 写图像 ---
-        camera_items = []
-        while not self._camera_queue.empty():
-            try:
-                camera_items.append(self._camera_queue.get_nowait())
-            except queue.Empty:
-                break
+        # 2. 转 numpy 方便搜索
+        cam_ts = np.array([c["timestamp"] for c in camera_items])
+        robot_ts = np.array([r["timestamp"] for r in robot_items])
+        action_ts = np.array([a["timestamp"] for a in action_items])
 
-        if camera_items:
-            n = len(camera_items)
-            cam_ts = []
-            cam_bytes = []
-            for item in camera_items:
-                cam_ts.append(item["timestamp"])
-                # JPEG 编码
-                ret, buf = cv2.imencode(".jpg", item["frame"], [
-                    cv2.IMWRITE_JPEG_QUALITY, 90
-                ])
-                if ret:
-                    cam_bytes.append(buf.tobytes())
-                else:
-                    cam_bytes.append(b"")
+        # === 一次性扩展所有数据集 ===
+        cur = f["timestamps"].shape[0]
+        n_total = len(camera_items)
+        for ds_name in ["timestamps", "obs/camera_0", "obs/joint_pos", "obs/joint_vel",
+                        "obs/eef_pose", "obs/gripper_pos",
+                        "action/eef_delta", "action/gripper", "action/raw_twist"]:
+            ds = f[ds_name]
+            ds.resize((cur + n_total, *ds.shape[1:]))
 
-            ts_ds = f["camera/timestamp"]
-            img_ds = f["camera/rgb"]
-            cur = ts_ds.shape[0]
-            ts_ds.resize((cur + n,))
-            ts_ds[cur:] = np.array(cam_ts)
-            img_ds.resize((cur + n,))
-            for i, b in enumerate(cam_bytes):
-                img_ds[cur + i] = np.frombuffer(b, dtype=np.uint8)
+        # 3. 为每个 camera 帧找到最近的 robot state 和 action
+        for ci, cam_item in enumerate(camera_items):
+            cam_t = cam_item["timestamp"]
+
+            # 找最近的 robot 状态
+            ri = np.argmin(np.abs(robot_ts - cam_t))
+            r_item = robot_items[ri] if ri < len(robot_items) else robot_items[-1]
+
+            # 找最近的动作
+            ai = np.argmin(np.abs(action_ts - cam_t))
+            a_item = action_items[ai] if ai < len(action_items) else action_items[-1]
+
+            # === obs ===
+            obs_pose = r_item["eef_pose"]
+            obs_jp = r_item["joint_pos"]
+            obs_jv = r_item["joint_vel"]
+            obs_gp = np.array([r_item["gripper_pos"]], dtype=np.float64)
+
+            # === action（通过 delta 计算） ===
+            if self._prev_pose is not None:
+                # eef_delta = 当前位姿 - 上一步位姿
+                eef_delta = obs_pose - self._prev_pose
+            else:
+                # 第一步：上一帧没有信息，先用 twist * dt 估计
+                eef_delta = np.zeros(6, dtype=np.float64)
+
+            self._prev_pose = obs_pose.copy()
+
+            # gripper action: 检测变化
+            if f["obs/gripper_pos"].shape[0] > 0:
+                gripper_prev = f["obs/gripper_pos"][-1]
+                gripper_action = obs_gp - gripper_prev[0]  # +1=关, -1=开, 0=不动
+            else:
+                # 第一帧无历史数据，gripper动作为0
+                gripper_action = np.array([0.0])
+            gripper_action = np.clip(gripper_action, -1.0, 1.0)
+
+            # === 写入 ===
+            idx = cur + ci
+            f["timestamps"][idx] = cam_t
+
+            # obs: 图像（JPEG 编码保存）
+            frame = cam_item["frame"]  # BGR from cv2
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            ret, buf = cv2.imencode(".jpg", frame_rgb, [cv2.IMWRITE_JPEG_QUALITY, self.cfg.jpeg_quality])
+            f["obs/camera_0"][idx] = np.frombuffer(buf, dtype=np.uint8) if ret else b""
+            f["obs/joint_vel"][idx] = obs_jv
+            f["obs/eef_pose"][idx] = obs_pose
+            f["obs/gripper_pos"][idx] = obs_gp
+
+            # action
+            f["action/eef_delta"][idx] = eef_delta
+            f["action/gripper"][idx] = gripper_action
+            f["action/raw_twist"][idx] = a_item["twist"]
 
         f.flush()
-
     def _close_episode(self):
-        """关闭当前 episode。"""
-        # 写剩余缓冲
-        self._flush_episode()
+        """关闭当前 episode（写剩余 + 计算）。"""
+        self._sync_and_write()
         if self._hdf5_file is not None:
             elapsed = time.time() - self._hdf5_file.attrs["start_time"]
-            robot_count = self._hdf5_file["robot/timestamp"].shape[0]
-            cam_count = self._hdf5_file["camera/timestamp"].shape[0]
+            n = self._hdf5_file["timestamps"].shape[0]
             self._hdf5_file.close()
             self._hdf5_file = None
-            print(
-                f"💾 Episode {self._episode:04d} 已保存: "
-                f"{elapsed:.1f}s, "
-                f"robot={robot_count} samples (~{robot_count / (elapsed + 1e-6):.0f} Hz), "
-                f"camera={cam_count} frames (~{cam_count / (elapsed + 1e-6):.0f} Hz)"
-            )
+            hz = n / (elapsed + 1e-6)
+            print(f"💾 Episode {self._episode:04d} 已保存: "
+                  f"{n} steps, {elapsed:.1f}s, {hz:.1f} Hz")
 
     def _ensure_output_dir(self):
-        """创建以当前时间命名的输出根目录。"""
         if not self._output_dir:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._output_dir = os.path.join(self.cfg.output_root, f"collection_{ts}")
+            self._output_dir = os.path.join(self.cfg.output_root, f"train_data_{ts}")
         os.makedirs(self._output_dir, exist_ok=True)
+
+    @staticmethod
+    def _drain(q):
+        items = []
+        while not q.empty():
+            try:
+                items.append(q.get_nowait())
+            except queue.Empty:
+                break
+        return items
 
     # ================================================================
     #  主循环
     # ================================================================
+
     def run(self):
         try:
-            # 启动后台线程
-            robot_thread = threading.Thread(target=self._robot_poll_thread, daemon=True)
-            camera_thread = threading.Thread(target=self._camera_capture_thread, daemon=True)
-            robot_thread.start()
-            camera_thread.start()
-            print("🚀 后台采集线程已启动")
+            # 启动三条后台线程
+            threads = [
+                threading.Thread(target=self._robot_poll_thread, daemon=True),
+                threading.Thread(target=self._camera_capture_thread, daemon=True),
+                threading.Thread(target=self._action_poll_thread, daemon=True),
+            ]
+            for t in threads:
+                t.start()
+            print("🚀 后台采集线程已启动 (robot 100Hz | camera 25Hz | action 100Hz)")
 
-            # --- 状态显示缓冲区（每 5 帧刷新一次显示信息） ---
             display_counter = 0
             rec_label = "■ IDLE"
 
             while self._running.is_set():
-                # 1. 读手柄
-                axes, hat, buttons = self.read_gamepad()
+                # === 1. 读取手柄（主循环 20Hz） ===
+                axes, hat, buttons = self._read_gamepad()
 
-                # 2. 检测退出
+                # 退出检测
                 if buttons.get(self.cfg.exit_button):
                     print("\n⏹ 退出程序...")
                     break
 
-                # 3. 录制 toggle (Y 按钮上升沿)
+                # 录制 toggle
                 y_pressed = bool(buttons.get(self.cfg.record_button))
                 if y_pressed and not self._prev_y:
                     if self._recording:
@@ -552,32 +565,55 @@ class KinovaDataCollector:
                         rec_label = "● REC"
                 self._prev_y = y_pressed
 
-                # 4. 夹爪
-                if buttons.get(0):  # A
-                    self.control_gripper(1.0)
+                # 夹爪
+                if buttons.get(0):
+                    self._send_gripper(1.0)
                     self._gripper_label = "CLOSED"
-                elif buttons.get(1):  # B
-                    self.control_gripper(0.0)
+                elif buttons.get(1):
+                    self._send_gripper(0.0)
                     self._gripper_label = "OPENED"
 
-                # 5. 发送 Twist
-                self.send_twist(axes, hat)
+                # 构建并发送 twist（从当前手柄状态）
+                twist_now = np.array([
+                    -axes[1] * self.cfg.speed_limit,
+                    -axes[0] * self.cfg.speed_limit,
+                    (axes[5] - axes[2]) * self.cfg.speed_limit,
+                    axes[3] * self.cfg.turn_limit,
+                    -axes[4] * self.cfg.turn_limit,
+                    -hat[0] * self.cfg.turn_limit,
+                ], dtype=np.float64)
+                has_input = np.any(np.abs(twist_now) > 0.001)
+                if has_input:
+                    cmd = Base_pb2.TwistCommand()
+                    cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+                    cmd.duration = 0
+                    cmd.twist.linear_x = twist_now[0]
+                    cmd.twist.linear_y = twist_now[1]
+                    cmd.twist.linear_z = twist_now[2]
+                    cmd.twist.angular_x = twist_now[3]
+                    cmd.twist.angular_y = twist_now[4]
+                    cmd.twist.angular_z = twist_now[5]
+                    self.base.SendTwistCommand(cmd)
+                else:
+                    self.base.Stop()
 
-                # 6. 录制：周期性 flush 缓冲
+                # === 2. 录制同步 ===
                 if self._recording:
                     display_counter += 1
                     if display_counter % 5 == 0:
-                        self._flush_episode()
+                        self._sync_and_write()
                 else:
-                    # 不录制时清空缓冲，避免堆积
-                    self._drain_queues()
+                    self._drain(self._robot_q)
+                    self._drain(self._camera_q)
+                    self._drain(self._action_q)
+                    self._prev_pose = None  # 重置
 
-                # 7. 终端状态显示
+                # === 3. 状态显示 ===
                 display_counter += 1
                 if display_counter % 5 == 0:
                     self._print_status(axes, hat, rec_label)
 
-                time.sleep(0.05)  # 20Hz 控制
+                time.sleep(0.05)  # 20Hz
 
         except KeyboardInterrupt:
             print("\n⚠️ 用户中断")
@@ -589,91 +625,87 @@ class KinovaDataCollector:
             self._cleanup()
 
     def _start_recording(self):
-        """开始新 episode 录制。"""
+        """开始新 episode。"""
         self._episode += 1
-        self._drain_queues()  # 清空可能残留的旧数据
+        self._task_counter += 1
+        self.cfg.task_id = self._task_counter
+
+        self._drain(self._robot_q)
+        self._drain(self._camera_q)
+        self._drain(self._action_q)
+        self._prev_pose = None
         self._open_episode(self._episode)
         self._recording = True
 
     def _stop_recording(self):
-        """停止当前录制。"""
         self._recording = False
         self._close_episode()
 
-    def _drain_queues(self):
-        """清空采集缓冲。"""
-        for q in (self._robot_queue, self._camera_queue):
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
-
     def _print_status(self, axes, hat, rec_label):
-        """刷新单行终端显示。"""
         a0, a1, _, a3, a4, _ = axes
-        joy_str = (
-            f"X:{a1:+5.2f} Y:{a0:+5.2f} Z:{axes[5]-axes[2]:+5.2f} | "
-            f"R:{a3:+5.2f} P:{a4:+5.2f} Y:{hat[0]:+2.0f} | "
-            f"Grip:{self._gripper_label}"
-        )
-        # 取最后一帧机器人数据
-        latest = None
-        if not self._robot_queue.empty():
-            try:
-                # peek 最新（不弹出）
-                pass
-            except Exception:
-                pass
-
+        joy_str = (f"X:{a1:+5.2f} Y:{a0:+5.2f} Z:{axes[5]-axes[2]:+5.2f} | "
+                   f"R:{a3:+5.2f} P:{a4:+5.2f} Y:{hat[0]:+2.0f} | "
+                   f"Grip:{self._gripper_label}")
+        # 如果录制中，显示当前步骤数
+        extra = ""
+        if self._recording and self._hdf5_file is not None:
+            n = self._hdf5_file["timestamps"].shape[0]
+            extra = f" | steps:{n}"
         sys.stdout.write(
             f"\r{rec_label}  {joy_str}  "
-            f"| Q:{self._robot_queue.qsize():<4}/{self._robot_queue.maxsize} "
-            f"CamQ:{self._camera_queue.qsize():<4}/{self._camera_queue.maxsize}     "
+            f"| Q:{self._robot_q.qsize():<4} ActQ:{self._action_q.qsize():<4} "
+            f"CamQ:{self._camera_q.qsize():<4}{extra}     "
         )
         sys.stdout.flush()
 
-    def _cleanup(self):
-        """清理：停止录制、断开连接、释放资源。"""
-        self._running.clear()
 
+    def _cleanup(self):
+        self._running.clear()
         if self._recording:
             self._recording = False
             self._close_episode()
-
-        # 停止机械臂
         if self.base:
             try:
                 self.base.Stop()
             except Exception:
                 pass
-
-        # 断开连接
         if self.connection:
             try:
                 self.connection.__exit__(None, None, None)
             except Exception:
                 pass
-
-        # 关闭摄像头
         if self.cap:
             self.cap.release()
-
         pygame.quit()
         cv2.destroyAllWindows()
         print("\n👋 安全退出。")
-
-        # 输出汇总
-        print("\n📁 数据保存位置:")
-        print(f"   {self._output_dir}" if self._output_dir else "   (无数据)")
+        if self._output_dir:
+            print(f"\n📁 数据保存位置:\n   {self._output_dir}")
+            print(f"   格式: obs/(camera_0, joint_pos, joint_vel, eef_pose, gripper_pos) + action/(eef_delta, gripper, raw_twist)")
 
 
 # ======================================================================
 #  Entry
 # ======================================================================
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Kinova Gen3 训练数据采集器")
+    parser.add_argument("--task", type=str, required=True,
+                        help="任务描述（language instruction），如 --task 'pick up the red cup'")
+    parser.add_argument("--ip", type=str, default="192.168.8.10",
+                        help="机械臂 IP 地址")
+    args = parser.parse_args()
+
+    cfg = Config()
+    cfg.task = args.task
+    cfg.robot_ip = args.ip
+
     print("=" * 60)
-    print("  Kinova Gen3 数据采集器 (Gamepad Teleop + Recording)")
+    print("  Kinova Gen3 训练数据采集器")
+    if cfg.task:
+        print(f"  🏷️  任务: {cfg.task}")
+    print("  输出格式: obs/action 对 + language instruction, 直接可用于 VLA 训练")
     print("=" * 60)
     print()
     print("  控制映射:")
@@ -681,9 +713,9 @@ if __name__ == "__main__":
     print("    LT/RT  → Z 轴升降   十字键 → Yaw")
     print("    A 关夹爪  B 开夹爪   Y → 开始/停止录制")
     print("    Menu 退出")
-    print()
+    print(f"  输出: ~/kinova_data/train_data_<timestamp>/episode_XXXX.h5")
 
-    collector = KinovaDataCollector()
+    collector = KinovaTrainDataCollector(cfg=cfg)
     try:
         collector.connect()
         collector.connect_camera()
