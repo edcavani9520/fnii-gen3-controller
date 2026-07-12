@@ -154,23 +154,14 @@ class KinovaTrainDataCollector:
         print(f"已连接 Kinova Gen3 机械臂 @ {self.cfg.robot_ip}")
 
     def connect_camera(self):
-        """初始化相机，固定曝光、白平衡、对焦，保证数据集光照一致性"""
+        """打开相机（使用默认参数）"""
         self.cap = cv2.VideoCapture(self.cfg.camera_id)
 
-        # 关闭自动曝光、自动白平衡、自动对焦
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)   # V4L2驱动：0.25=手动曝光
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, -5)
-        self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-        self.cap.set(cv2.CAP_PROP_GAIN, 0)
-        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-        self.cap.set(cv2.CAP_PROP_FOCUS, 0)
-
-        # 设置图像分辨率与帧率
+        # 仅设置分辨率和帧率
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.camera_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.camera_height)
         self.cap.set(cv2.CAP_PROP_FPS, self.cfg.camera_fps)
 
-        # 测试读取一帧图像验证相机
         ret, frame = self.cap.read()
         if not ret:
             raise RuntimeError("相机读取图像失败，请检查摄像头")
