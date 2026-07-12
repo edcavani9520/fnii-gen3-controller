@@ -33,6 +33,7 @@ os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 import time
 import datetime
+import threading
 from typing import Optional
 from dataclasses import dataclass
 
@@ -86,6 +87,14 @@ class Config:
 # ======================================================================
 # 主采集类：Kinova遥操作数据采集
 # ======================================================================
+
+def _check_for_end_or_abort(e):
+    def check(notification, e=e):
+        if notification.action_event == Base_pb2.ACTION_END \
+        or notification.action_event == Base_pb2.ACTION_ABORT:
+            e.set()
+    return check
+
 class KinovaTrainDataCollector:
 
     def __init__(self, cfg: Config = None):
@@ -119,6 +128,7 @@ class KinovaTrainDataCollector:
         # ---- 按键边沿检测（防止长按反复触发） ----
         self._prev_y = False
         self._prev_x = False
+        self._prev_lb = False
 
         # ---- 差分action计算缓存 ----
         self._prev_eef_pose: Optional[np.ndarray] = None
@@ -408,6 +418,7 @@ class KinovaTrainDataCollector:
 
                 self._prev_y = y_pressed
                 self._prev_x = x_pressed
+                self._prev_lb = bool(buttons.get(4))
 
                 # 3. 更新夹爪目标指令状态
                 if buttons.get(0):
@@ -416,6 +427,10 @@ class KinovaTrainDataCollector:
                     self._last_gripper_cmd = 0.0
 
                 # 4. 下发机器人运动控制指令（优先下发保证操控实时性）
+                # LB button -> home position
+                if buttons.get(4) and not self._prev_lb:
+                    self.go_to_home_pose()
+
                 has_input = self._send_twist_if_needed(axes, hat)
                 if buttons.get(0):
                     self._send_gripper(1.0)
@@ -503,6 +518,51 @@ class KinovaTrainDataCollector:
     # ================================================================
     # 终端实时状态打印
     # ================================================================
+    def go_to_home_pose(self):
+        """Move to home pose"""
+        print("Home...")
+        self.base.Stop()
+        time.sleep(0.1)
+
+        servo_mode = Base_pb2.ServoingModeInformation()
+        servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
+        self.base.SetServoingMode(servo_mode)
+
+        waypoints = Base_pb2.WaypointList()
+        waypoints.duration = 0.0
+        waypoints.use_optimal_blending = False
+
+        wp = waypoints.waypoints.add()
+        wp.name = "home"
+        wp.cartesian_waypoint.pose.x = 0.131
+        wp.cartesian_waypoint.pose.y = -0.004
+        wp.cartesian_waypoint.pose.z = 0.21
+        wp.cartesian_waypoint.pose.theta_x = 176.39
+        wp.cartesian_waypoint.pose.theta_y = 0.923
+        wp.cartesian_waypoint.pose.theta_z = 90.271
+        wp.cartesian_waypoint.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+
+        e = threading.Event()
+        notif_handle = self.base.OnNotificationActionTopic(
+            _check_for_end_or_abort(e),
+            Base_pb2.NotificationOptions()
+        )
+
+        try:
+            print("Moving to home...")
+            self.base.ExecuteWaypointTrajectory(waypoints)
+            finished = e.wait(20.0)
+            self.base.Unsubscribe(notif_handle)
+            if finished:
+                self._send_gripper(0.0)
+                self._prev_eef_pose = None
+                print("Home reached")
+            else:
+                print("Home timeout")
+        except Exception as ex:
+            self.base.Unsubscribe(notif_handle)
+            print(f"Home failed: {ex}")
+
     def _print_status(self, axes, hat, rec_label):
         a0, a1, _, a3, a4, _ = axes
         if self._last_gripper_cmd > 0.5:
@@ -546,7 +606,10 @@ class KinovaTrainDataCollector:
         if self.cap:
             self.cap.release()
         pygame.quit()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         print("\n程序资源释放完成，安全退出")
         if self._output_dir:
             print(f"\n数据集存储目录：\n   {self._output_dir}")
