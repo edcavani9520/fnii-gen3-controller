@@ -199,7 +199,10 @@ class KinovaTrainDataCollector:
         ret, frame = self.cap.read()
         if not ret:
             return None
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)   # (H, W) uint8
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Resize to target resolution (camera may output different size than config)
+        if gray.shape[0] != self.cfg.camera_height or gray.shape[1] != self.cfg.camera_width:
+            gray = cv2.resize(gray, (self.cfg.camera_width, self.cfg.camera_height))
 
         # 获取机械臂实时反馈数据
         try:
