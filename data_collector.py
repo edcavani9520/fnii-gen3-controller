@@ -418,7 +418,6 @@ class KinovaTrainDataCollector:
 
                 self._prev_y = y_pressed
                 self._prev_x = x_pressed
-                self._prev_lb = bool(buttons.get(4))
 
                 # 3. 更新夹爪目标指令状态
                 if buttons.get(0):
@@ -431,6 +430,7 @@ class KinovaTrainDataCollector:
                 if buttons.get(4) and not self._prev_lb:
                     self.go_to_home_pose()
 
+                self._prev_lb = bool(buttons.get(4))
                 has_input = self._send_twist_if_needed(axes, hat)
                 if buttons.get(0):
                     self._send_gripper(1.0)
