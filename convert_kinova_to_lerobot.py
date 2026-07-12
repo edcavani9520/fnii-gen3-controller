@@ -1,154 +1,155 @@
-#!/usr/bin/env python
-"""convert_kinova_to_lerobot.py — 将 Kinova Gen3 h5 原始数据转换为 LeRobot 格式
-
-用法:
-  python convert_kinova_to_lerobot.py
-  python convert_kinova_to_lerobot.py --h5 <path> --out <dataset_name>
-
-输出位置: lerobot_data/<dataset_name>/
+﻿#!/usr/bin/env python3
 """
+convert_kinova_to_lerobot.py
+
+Convert Kinova Gen3 HDF5 episodes to LeRobot dataset format.
+Compatible with LeRobot v3 API (physical-intelligence fork).
+
+Usage:
+    # Install leRobot first:
+    pip install git+https://github.com/physical-intelligence/lerobot.git
+
+    # Run conversion:
+    python convert_kinova_to_lerobot.py \\
+        --h5-dir ~/kinova_data/train_data_20260712_173158 \\
+        --output-dir ~/lerobot_datasets/kinova_cube \\
+        --fps 10
+"""
+
+import os
 import sys
+import time
 import argparse
-import cv2
-import numpy as np
-import h5py
 from pathlib import Path
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-# ===== 输出目录配置 =====
-OUTPUT_ROOT = Path.home() / "lerobot_data"  # 所有 LeRobot 数据都放这里
+import h5py
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
 
-
-def load_episode_h5(h5_path: str):
-    """从 episode h5 提取关节角和 JPEG 帧"""
-    with h5py.File(h5_path, "r") as f:
-        rgb_bytes = f["camera/rgb"][:]             # (N,) object  ← JPEG bytes
-        cam_ts = f["camera/timestamp"][:].astype(np.float64)
-        joint_pos_deg = f["robot/joint_position"][:].astype(np.float64)  # (M, 7)
-        robot_ts = f["robot/timestamp"][:].astype(np.float64)
-
-    # 解码第一帧确认尺寸
-    sample = cv2.imdecode(rgb_bytes[0], cv2.IMREAD_COLOR)
-    assert sample is not None, "无法解码 JPEG 帧"
-    H, W = sample.shape[:2]
-
-    # 关节角 度 → 弧度
-    joint_pos = np.deg2rad(joint_pos_deg)
-
-    # 时间同步: camera 帧 → 最近的 robot 时间点
-    sync = np.searchsorted(robot_ts, cam_ts)
-    sync = np.clip(sync, 0, len(joint_pos) - 1)
-    for i in range(len(cam_ts)):
-        idx = sync[i]
-        if idx > 0 and abs(cam_ts[i] - robot_ts[idx - 1]) < abs(cam_ts[i] - robot_ts[idx]):
-            sync[i] = idx - 1
-
-    print(f"  [h5] {len(rgb_bytes)} 帧, {W}x{H}, {len(joint_pos)} 个 robot 时间点")
-    return rgb_bytes, joint_pos, sync, H, W
+try:
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+except ImportError:
+    print("Please install LeRobot first:")
+    print("  pip install git+https://github.com/physical-intelligence/lerobot.git")
+    sys.exit(1)
 
 
-def decode_jpeg(jpeg_bytes: bytes) -> np.ndarray:
-    """解码 JPEG 字节 → BGR uint8"""
-    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return img  # (H, W, 3), BGR
+def find_instruction(f):
+    """Read instruction from attrs with multiple fallback paths."""
+    for key in ["instruction", "task/language_instruction", "task/instruction"]:
+        val = f.attrs.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return "unnamed_task"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Kinova Gen3 h5 → LeRobot 格式")
-    parser.add_argument("--h5", default="episode_0002.h5",
-                        help="输入 h5 文件路径")
-    parser.add_argument("--out", default="kinova_gen3_deblur_v1",
-                        help="数据集名称 (输出到 lerobot_data/<name>/")
-    parser.add_argument("--task", default="push the cup to the right",
-                        help="语言指令")
-    args = parser.parse_args()
+def convert(args):
+    h5_dir = Path(args.h5_dir)
+    output_dir = Path(args.output_dir)
+    fps = args.fps
 
-    h5_path = Path(args.h5)
-    if not h5_path.exists():
-        # 尝试在 deblurrin 项目目录下找
-        alt = Path.home() / "Robot-Kinematics-Guided-Spatially-Varying-Motion-Deblurrin" / args.h5
-        if alt.exists():
-            h5_path = alt
-        else:
-            print(f"❌ 找不到 h5 文件: {args.h5}")
-            sys.exit(1)
+    if not h5_dir.exists():
+        print(f"ERROR: {h5_dir} does not exist")
+        sys.exit(1)
 
-    repo_id = args.out
-    output_dir = OUTPUT_ROOT / repo_id
-    print(f"📥 输入: {h5_path}")
-    print(f"📦 输出: {output_dir}")
+    h5_files = sorted(h5_dir.glob("episode_*.h5"))
+    if not h5_files:
+        print(f"No episode_*.h5 files found in {h5_dir}")
+        sys.exit(1)
 
-    # 1. 加载 h5
-    rgb_bytes, joint_pos, sync_indices, H, W = load_episode_h5(str(h5_path))
-    num_frames = len(rgb_bytes)
-    print(f"   有效帧: {num_frames}")
+    print(f"Found {len(h5_files)} episodes")
+    print(f"Output: {output_dir}")
 
-    # 2. 创建 LeRobot 数据集（用自定义输出路径）
+    # Read first file to determine shapes
+    with h5py.File(h5_files[0], "r") as f:
+        img = f["obs/image"]
+        T, H, W = img.shape
+
+    # Remove output dir if exists
+    if output_dir.exists():
+        import shutil
+        shutil.rmtree(output_dir)
+
+    # Create LeRobot dataset
     dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        root=OUTPUT_ROOT,  # ← 指定根目录，不依赖 HF_LEROBOT_HOME
+        repo_id=output_dir.name,
         robot_type="kinova_gen3",
-        fps=10,
+        fps=fps,
         features={
-            "image": {
-                "dtype": "image",
-                "shape": (224, 224, 3),
-                "names": ["height", "width", "channel"],
+            "observation.images.camera": {
+                "dtype": "video",
+                "shape": (3, H, W),
             },
-            "wrist_image": {
-                "dtype": "image",
-                "shape": (224, 224, 3),
-                "names": ["height", "width", "channel"],
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (8,),
+                "names": [
+                    "joint_1", "joint_2", "joint_3", "joint_4",
+                    "joint_5", "joint_6", "joint_7", "gripper",
+                ],
             },
-            "state": {
+            "action": {
                 "dtype": "float32",
                 "shape": (7,),
-                "names": ["state"],
-            },
-            "actions": {
-                "dtype": "float32",
-                "shape": (7,),
-                "names": ["actions"],
+                "names": [
+                    "dx", "dy", "dz",
+                    "droll", "dpitch", "dyaw",
+                    "gripper",
+                ],
             },
         },
+        root=output_dir.parent,
     )
 
-    # 3. 逐帧添加
-    print("📝 写入帧...")
-    for i in range(num_frames):
-        img_bgr = decode_jpeg(rgb_bytes[i])
-        if img_bgr is None:
-            print(f"   ⚠️ 跳过第 {i} 帧: 解码失败")
-            continue
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img_rgb = cv2.resize(img_rgb, (224, 224))
+    # Process each episode
+    total_frames = 0
+    t_start = time.time()
 
-        ri = sync_indices[i]
-        state = joint_pos[ri].astype(np.float32)
-        next_idx = min(ri + 1, len(joint_pos) - 1)
-        action = joint_pos[next_idx].astype(np.float32)
+    for h5_path in tqdm(h5_files, desc="Episodes"):
+        with h5py.File(h5_path, "r") as f:
+            images = f["obs/image"][:]
+            states = f["obs/proprio"][:]
+            actions = f["action"][:]
+            ts = f["timestamps"][:]
+            instruction = find_instruction(f)
 
-        dataset.add_frame({
-            "image": img_rgb,
-            "wrist_image": img_rgb.copy(),
-            "state": state,
-            "actions": action,
-            "task": args.task,
-        })
+        # Use relative timestamps (0 = episode start)
+        t0 = float(ts[0])
+        timestamps = [float(t) - t0 for t in ts]
 
-        if (i + 1) % 50 == 0:
-            print(f"   {i + 1}/{num_frames}")
+        Ti = len(images)
+        for i in range(Ti):
+            gray = images[i]
+            rgb = np.stack([gray, gray, gray], axis=-1)
 
-    # 4. 保存
-    dataset.save_episode()
-    print(f"\n✅ 转换完成!")
-    print(f"   episodes: {dataset.num_episodes}")
-    print(f"   frames:   {dataset.num_frames}")
-    print(f"   保存路径: {output_dir}")
-    print(f"\n下一步: 在 openpi 中训练时使用 repo_id='{repo_id}'")
-    print(f"       数据路径: {output_dir}")
+            dataset.add_frame({
+                "observation.images.camera": Image.fromarray(rgb),
+                "observation.state": states[i].astype(np.float32),
+                "action": actions[i].astype(np.float32),
+                "timestamp": timestamps[i],
+                "task": instruction,
+            })
+
+        dataset.save_episode()
+        total_frames += Ti
+
+    dataset.consolidate()
+
+    elapsed = time.time() - t_start
+    print(f"\nDone: {len(h5_files)} episodes, {total_frames} frames, {elapsed:.1f}s")
+    print(f"Dataset: {output_dir}")
+    print(f"\n  View it:")
+    print(f"    lerobot-dataset-viz --repo-id {output_dir.name} --root {output_dir.parent}")
+    print(f"\n  Load in Python:")
+    print(f"    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset")
+    print(f"    ds = LeRobotDataset('{output_dir.name}', root='{output_dir.parent}')")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--h5-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--fps", type=int, default=10)
+    args = parser.parse_args()
+    convert(args)
