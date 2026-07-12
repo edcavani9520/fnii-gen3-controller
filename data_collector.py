@@ -154,11 +154,12 @@ class KinovaTrainDataCollector:
         print(f"已连接 Kinova Gen3 机械臂 @ {self.cfg.robot_ip}")
 
     def connect_camera(self):
-        """打开相机，启用自动曝光"""
+        """打开相机，手动控制曝光"""
         self.cap = cv2.VideoCapture(self.cfg.camera_id)
 
-        # 启用自动曝光（V4L2: 1=自动, 0=手动）
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
+        # 先切换到手动曝光模式，再设置固定曝光值
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.0)   # 0=手动
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, 100)        # 手动曝光值（越小越暗）
 
         # 设置分辨率和帧率
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.camera_width)
