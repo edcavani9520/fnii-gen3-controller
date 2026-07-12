@@ -447,12 +447,13 @@ class KinovaTrainDataCollector:
                 self._prev_eef_pose = data["eef_pose"].copy()
 
                 # 兜底：若无夹爪指令则使用当前实际开度
-                gripper_target = self._last_gripper_cmd
-                if gripper_target < 0:
-                    gripper_target = data["gripper_pos"]
+                # 夹爪使用手柄指令值 [0,1]，不直接用电机反馈原始值
+                gripper_cmd = self._last_gripper_cmd
+                if gripper_cmd < 0:
+                    gripper_cmd = 0.0  # 默认张开
 
-                action_7d = np.concatenate([delta_pose, [gripper_target]])
-                proprio_8d = np.concatenate([data["joint_pos"], [data["gripper_pos"]]])
+                action_7d = np.concatenate([delta_pose, [gripper_cmd]])
+                proprio_8d = np.concatenate([data["joint_pos"], [gripper_cmd]])
 
                 # 7. 录制状态下写入样本
                 if self._recording:
