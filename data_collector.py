@@ -1,28 +1,28 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-Kinova Gen3 ���ݲɼ��� - ��0.5 ѵ����ʽ
+Kinova Gen3 数据采集器 - π0.5 训练格式
 =========================================
-10Hz ͬ���ɼ���ͬһʱ���ץͼ+������״̬+����
-��� HDF5 ��ʽ���� OpenPI / ��0.5 ѵ����·
+10Hz 同步采集同一时间戳抓图+机器人状态+动作
+输出 HDF5 格式兼容 OpenPI / π0.5 训练链路
 
-�����ʽ��ÿ episode һ�� HDF5��:
+输出格式（每 episode 一个 HDF5）::
   obs/
-    image     (T, H, W) uint8         �� ��ͨ���Ҷ�ͼ��640��480��
-    proprio   (T, 8) float64          �� [7�ؽڽǶ�, ��צ����]
-  action      (T, 7) float64          �� [��x,��y,��z,��rx,��ry,��rz, gripper_target]
-  timestamps  (T,) float64            �� ÿ��ʱ���
+    image     (T, H, W) uint8         — 单通道灰度图（640×480）
+    proprio   (T, 8) float64          — [7关节角度, 夹爪开度]
+  action      (T, 7) float64          — [Δx,Δy,Δz,Δrx,Δry,Δrz, gripper_target]
+  timestamps  (T,) float64            — 每步时间戳
 
-����ӳ��:
-  ��ҡ��        �� XY ƽ��
-  LT/RT         �� Z ������
-  ��ҡ��        �� Roll / Pitch
-  ʮ�ּ�����    �� Yaw
-  A / B         �� ��צ��/��
-  Y             �� ��ʼ¼�ƣ��ٰ� Y ����ֹͣ���� X ɾ��
-  LB(��ť4)     �� �ص�ԭ��
-  Menu(��ť7)   �� �˳�����
+控制映射::
+  左摇杆        开 XY 平移
+  LT/RT         开 Z 错误开
+  左摇杆        开 Roll / Pitch
+  错误    开 Yaw
+  A / B         开 夹爪开/开
+  Y             开 开始录开 Y 错误错误 X 开
+  LB(开4)     开 开
+  Menu(开7)   开 错误
 
-�÷�:
+:
   python data_collector.py --task "place the block into the bowl"
 """
 
@@ -51,62 +51,62 @@ from kortex_api.autogen.messages import Base_pb2, BaseCyclic_pb2
 
 
 # ======================================================================
-#  ����
+#  错误
 # ======================================================================
 @dataclass
 class Config:
-    # ---- ��е�� ----
+    # ---- 机械臂 ----
     robot_ip: str = "192.168.8.10"
     speed_limit: float = 0.20       # m/s
-    turn_limit: float = 20.0        # ��/s
+    turn_limit: float = 20.0        # 开/s
     deadzone: float = 0.1
 
-    # ---- ����������������ɼ�=�����----
+    # ---- 相机（参数锁定采集=推理）----
     camera_id: int = 0
     camera_width: int = 640
     camera_height: int = 480
     camera_fps: int = 10            # 10Hz
 
-    # ---- �ɼ� ----
+    # ---- 采集 ----
     output_root: str = os.path.expanduser("~/kinova_data")
-    sample_hz: int = 10             # ͬ���ɼ� 10Hz
+    sample_hz: int = 10             # 输出 10Hz
 
-    # ---- �������� ----
+    # ---- 错误错误 ----
     task: str = ""
     task_id: int = 0
 
-    # ---- ¼�ƿ��� ----
+    # ---- 录输出 ----
     record_button: int = 3          # Y
     delete_button: int = 2          # X
     exit_button: int = 7            # Menu
 
 
 # ======================================================================
-#  ���ݲɼ���
+#  输出输出
 # ======================================================================
 class KinovaTrainDataCollector:
 
     def __init__(self, cfg: Config = None):
         self.cfg = cfg or Config()
 
-        # ---- Kinova ���� ----
+        # ---- Kinova 错误 ----
         self.base: Optional[BaseClient] = None
         self.base_cyclic: Optional[BaseCyclicClient] = None
         self.router = None
         self.connection = None
 
-        # ---- �ֱ� ----
+        # ---- 手柄 ----
         pygame.init()
         pygame.joystick.init()
         if pygame.joystick.get_count() == 0:
-            raise RuntimeError("δ��⵽�ֱ�")
+            raise RuntimeError("未检测到手柄")
         self.joy = pygame.joystick.Joystick(0)
         self.joy.init()
 
-        # ---- ��� ----
+        # ---- 相机 ----
         self.cap: Optional[cv2.VideoCapture] = None
 
-        # ---- ¼��״̬ ----
+        # ---- 录制状态 ----
         self._recording = False
         self._episode = 0
         self._task_counter = 0
@@ -114,18 +114,18 @@ class KinovaTrainDataCollector:
         self._hdf5_file: Optional[h5py.File] = None
         self._running = True
 
-        # ---- ���ؼ�� ----
+        # ---- 边沿检测 ----
         self._prev_y = False
         self._prev_x = False
 
-        # ---- delta ���㻺�� ----
+        # ---- delta 计算缓存 ----
         self._prev_eef_pose: Optional[np.ndarray] = None
-        self._last_gripper_cmd: float = -1.0   # -1 = δ��ʼ��
+        self._last_gripper_cmd: float = -1.0   # -1 = 未初始化
 
-        print(f"�ֱ�������: {self.joy.get_name()}")
+        print(f"错误输出: {self.joy.get_name()}")
 
     # ================================================================
-    #  ����
+    #  错误
     # ================================================================
 
     def connect(self):
@@ -140,35 +140,35 @@ class KinovaTrainDataCollector:
         self.router = self.connection.__enter__()
         self.base = BaseClient(self.router)
         self.base_cyclic = BaseCyclicClient(self.router)
-        print(f"������ Kinova @ {self.cfg.robot_ip}")
+        print(f"错误开 Kinova @ {self.cfg.robot_ip}")
 
     def connect_camera(self):
-        """�����������ȫ���Զ�����"""
+        """错误错误输出输出错误"""
         self.cap = cv2.VideoCapture(self.cfg.camera_id)
 
-        # ---- �����Զ����� ----
+        # ---- 错误错误 ----
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)   # 0.25 = off (V4L2)
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, -5)           # �ֶ��̶�
-        self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)             # ���Զ���ƽ��
-        self.cap.set(cv2.CAP_PROP_GAIN, 0)                # �̶�����
-        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)           # ���Զ��Խ�
-        self.cap.set(cv2.CAP_PROP_FOCUS, 0)               # �̶�����
-        # �����ȫ�ֿ���������˴�����������
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, -5)           # 开
+        self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)             # 输出输出平移
+        self.cap.set(cv2.CAP_PROP_GAIN, 0)                # 错误
+        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)           # 输出开
+        self.cap.set(cv2.CAP_PROP_FOCUS, 0)               # 错误
+        # 错误错误错误错误错误输出
 
-        # ---- �ֱ��� & ֡�� ----
+        # ---- 输出 & 开 ----
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.camera_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.camera_height)
         self.cap.set(cv2.CAP_PROP_FPS, self.cfg.camera_fps)
 
-        # ---- ��֤ ----
+        # ---- 开 ----
         ret, frame = self.cap.read()
         if not ret:
-            raise RuntimeError("���������")
+            raise RuntimeError("错误错误")
         actual_h, actual_w = frame.shape[:2]
-        print(f"����Ѵ�: {actual_w}x{actual_h} @ {self.cfg.camera_fps} FPS��������������")
+        print(f"错误: {actual_w}x{actual_h} @ {self.cfg.camera_fps} FPS错误错误错误开")
 
     # ================================================================
-    #  �ֱ���ȡ
+    #  输出
     # ================================================================
 
     def _read_gamepad(self):
@@ -187,24 +187,24 @@ class KinovaTrainDataCollector:
         return v if abs(v) > self.cfg.deadzone else 0.0
 
     # ================================================================
-    #  ͬ���ɼ������ģ���ʱ��� ͼ+������+������
+    #  输出错误开输出时间戳 ͼ+错误开+错误开
     # ================================================================
 
     def _sync_step(self, axes, hat, buttons) -> Optional[dict]:
         """
-        ��ͬһ��ʱ�������ɣ�
-        1. ��ȡ�Ҷ�ͼ
-        2. ��ȡ������״̬���ؽڽǡ�ĩ��λ�ˡ���צ��
-        3. ���� twist ָ�������
-        4. ���� {timestamp, image, joint_pos, gripper_pos, eef_pose}
+        开开错误输出
+        1. 开灰度图
+        2. 开错误开输出占位输出开
+        3. 错误 twist 错误开
+        4. 错误 {timestamp, image, joint_pos, gripper_pos, eef_pose}
         """
-        # ---- 1. ��� ----
+        # ---- 1. 输出 ----
         ret, frame = self.cap.read()
         if not ret:
             return None
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)   # (H, W) uint8
 
-        # ---- 2. ������ ----
+        # ---- 2. 错误开 ----
         try:
             fb = self.base_cyclic.RefreshFeedback()
         except Exception:
@@ -212,21 +212,21 @@ class KinovaTrainDataCollector:
         b = fb.base
         inter = fb.interconnect
 
-        # �ؽ�λ�ã�Gen3 �� 7 ���ؽڣ�
+        # 关节位置（Gen3 有 7 个关节）
         joint_pos = np.array([act.position for act in fb.actuators], dtype=np.float64)
 
-        # ��צ����
+        # 夹爪开度
         gripper_pos = 0.0
         if inter.gripper_feedback.motor:
             gripper_pos = float(inter.gripper_feedback.motor[0].position)
 
-        # ĩ�˵ѿ���λ��
+        # 末端笛卡尔位姿
         eef_pose = np.array([
             b.tool_pose_x, b.tool_pose_y, b.tool_pose_z,
             b.tool_pose_theta_x, b.tool_pose_theta_y, b.tool_pose_theta_z
         ], dtype=np.float64)
 
-        # ---- 3. ���� twist �������� ----
+        # ---- 3. 错误 twist 错误错误 ----
         twist = np.array([
             -axes[1] * self.cfg.speed_limit,
             -axes[0] * self.cfg.speed_limit,
@@ -251,10 +251,10 @@ class KinovaTrainDataCollector:
         else:
             self.base.Stop()
 
-        # ---- 4. ���ͼ�צ ----
-        if buttons.get(0):       # A = �ر�
+        # ---- 4. 输出ͼ ----
+        if buttons.get(0):       # A = 关闭
             self._send_gripper(1.0)
-        elif buttons.get(1):     # B = ��
+        elif buttons.get(1):     # B = 打开
             self._send_gripper(0.0)
 
         return {
@@ -266,7 +266,7 @@ class KinovaTrainDataCollector:
         }
 
     # ================================================================
-    #  ������ָ��
+    #  错误开开
     # ================================================================
 
     def _send_gripper(self, pos: float):
@@ -281,7 +281,7 @@ class KinovaTrainDataCollector:
             pass
 
     # ================================================================
-    #  HDF5 ���
+    #  HDF5 输出
     # ================================================================
 
     def _open_episode(self, episode: int):
@@ -302,7 +302,7 @@ class KinovaTrainDataCollector:
             dtype=np.float64,
         )
 
-        # === action������ dataset��===
+        # === action错误开 dataset开===
         f.create_dataset(
             "action", shape=(0, 7), maxshape=(None, 7),
             dtype=np.float64,
@@ -332,28 +332,28 @@ class KinovaTrainDataCollector:
         f.attrs["camera_height"] = H
         f.attrs["sample_hz"] = self.cfg.sample_hz
         f.attrs["date_collected"] = datetime.datetime.now().isoformat()
-        f.attrs["success"] = True    # ռλ��������ϴʱ��������
+        f.attrs["success"] = True    # 占位错误错误ϴ错误错误
 
         self._hdf5_file = f
-        self._prev_eef_pose = None   # �� episode ���� delta ����
-        print(f"\n��ʼ¼�� �� {fname}")
+        self._prev_eef_pose = None   # 新 episode 错误 delta 错误
+        print(f"\n开始录制 开 {fname}")
         print(f"   task: {task_desc}")
 
     def _write_step(self, ts, image, proprio, action):
-        """д��һ֡ͬ�����ݵ� HDF5"""
+        """开错误 HDF5"""
         f = self._hdf5_file
         if f is None:
             return
 
         cur = f["timestamps"].shape[0]
 
-        # ��չ���� dataset
+        # 开错误 dataset
         f["timestamps"].resize((cur + 1,))
         f["obs/image"].resize((cur + 1, f["obs/image"].shape[1], f["obs/image"].shape[2]))
         f["obs/proprio"].resize((cur + 1, 8))
         f["action"].resize((cur + 1, 7))
 
-        # д��
+        # 开
         f["timestamps"][cur] = ts
         f["obs/image"][cur] = image
         f["obs/proprio"][cur] = proprio
@@ -361,14 +361,14 @@ class KinovaTrainDataCollector:
         f.flush()
 
     def _close_episode(self):
-        """�رյ�ǰ episode"""
+        """关闭当前 episode"""
         if self._hdf5_file is not None:
             elapsed = time.time() - self._hdf5_file.attrs["start_time"]
             n = self._hdf5_file["timestamps"].shape[0]
             self._hdf5_file.close()
             self._hdf5_file = None
             hz = n / (elapsed + 1e-6)
-            print(f"Episode {self._episode:04d} �ѱ���: "
+            print(f"Episode {self._episode:04d} 输出: "
                   f"{n} steps, {elapsed:.1f}s, {hz:.1f} Hz")
 
     def _ensure_output_dir(self):
@@ -378,59 +378,59 @@ class KinovaTrainDataCollector:
         os.makedirs(self._output_dir, exist_ok=True)
 
     # ================================================================
-    #  ��ѭ��
+    #  开开
     # ================================================================
 
     def run(self):
         try:
-            print("ͬ���ɼ���� @ 10Hz")
-            print("  Y �� ��ʼ¼��  �ٰ� Y �� ����ֹͣ  �� X �� ɾ��ֹͣ")
-            print("  LB �� �ص�ԭ��  Menu �� �˳�\n")
+            print("输出错误 @ 10Hz")
+            print("  Y 开 开始录制   Y 开 错误  开 X 开 开")
+            print("  LB → 回到原点  Menu → 退出\n")
 
             display_counter = 0
-            rec_label = "�� IDLE"
+            rec_label = "开 IDLE"
 
             while self._running:
-                # === 1. ��ȡ�ֱ� ===
+                # === 1. 开 ===
                 axes, hat, buttons = self._read_gamepad()
 
-                # �˳�
+                # 退出
                 if buttons.get(self.cfg.exit_button):
-                    print("\n�˳�����...")
+                    print("\n错误...")
                     break
 
-                # === 2. ¼�ƿ��� ===
+                # === 2. 录输出 ===
                 y_pressed = bool(buttons.get(self.cfg.record_button))
                 x_pressed = bool(buttons.get(self.cfg.delete_button))
 
                 if y_pressed and not self._prev_y:
                     if not self._recording:
                         self._start_recording()
-                        rec_label = "�� REC"
+                        rec_label = "开 REC"
                     else:
                         self._stop_recording()
-                        rec_label = "�� IDLE"
+                        rec_label = "开 IDLE"
 
                 if x_pressed and not self._prev_x:
                     if self._recording:
                         self._stop_recording(delete=True)
-                        rec_label = "�� IDLE"
+                        rec_label = "开 IDLE"
 
                 self._prev_y = y_pressed
                 self._prev_x = x_pressed
 
-                # === 3. ��¼��צ��ͼ ===
+                # === 3. 不录制开ͼ ===
                 if buttons.get(0):
                     self._last_gripper_cmd = 1.0
                 elif buttons.get(1):
                     self._last_gripper_cmd = 0.0
 
-                # === 4. ͬ���ɼ�����ʱ��� ͼ+������+���� ===
+                # === 4. 输出错误时间戳 ͼ+错误开+错误 ===
                 data = self._sync_step(axes, hat, buttons)
                 if data is None:
                     continue
 
-                # === 5. ���� 7 ά���� ===
+                # === 5. 错误 7 ά错误 ===
                 # delta pose
                 if self._prev_eef_pose is not None:
                     delta_pose = data["eef_pose"] - self._prev_eef_pose
@@ -446,13 +446,13 @@ class KinovaTrainDataCollector:
 
                 # gripper target
                 gripper_target = self._last_gripper_cmd
-                if gripper_target < 0:          # �״�δ��ʼ��
+                if gripper_target < 0:          # 未初始化
                     gripper_target = data["gripper_pos"]
 
                 action_7d = np.concatenate([delta_pose, [gripper_target]])
                 proprio_8d = np.concatenate([data["joint_pos"], [data["gripper_pos"]]])
 
-                # === 6. д�� HDF5 ===
+                # === 6. 写入 HDF5 ===
                 if self._recording:
                     self._write_step(
                         data["timestamp"],
@@ -461,9 +461,9 @@ class KinovaTrainDataCollector:
                         action_7d,
                     )
                 else:
-                    self._prev_eef_pose = None   # ��¼��ʱ����
+                    self._prev_eef_pose = None   # 不录制错误
 
-                # === 7. ״̬��ʾ ===
+                # === 7. 开 ===
                 display_counter += 1
                 if display_counter % 5 == 0:
                     self._print_status(axes, hat, rec_label)
@@ -472,16 +472,16 @@ class KinovaTrainDataCollector:
                 time.sleep(1.0 / self.cfg.sample_hz)
 
         except KeyboardInterrupt:
-            print("\n�û��ж�")
+            print("\n用户中断")
         except Exception as e:
-            print(f"\n����: {e}")
+            print(f"\n错误: {e}")
             import traceback
             traceback.print_exc()
         finally:
             self._cleanup()
 
     # ================================================================
-    #  ¼����������
+    #  录错误错误开
     # ================================================================
 
     def _start_recording(self):
@@ -500,12 +500,12 @@ class KinovaTrainDataCollector:
             self._close_episode()
             if fname and os.path.exists(fname):
                 os.remove(fname)
-                print(f"��ɾ�� episode {self._episode:04d}: {fname}")
+                print(f"开新 episode {self._episode:04d}: {fname}")
         else:
             self._close_episode()
 
     # ================================================================
-    #  ״̬��ʾ
+    #  开
     # ================================================================
 
     def _print_status(self, axes, hat, rec_label):
@@ -522,7 +522,7 @@ class KinovaTrainDataCollector:
         sys.stdout.flush()
 
     # ================================================================
-    #  ����
+    #  错误
     # ================================================================
 
     def _cleanup(self):
@@ -544,10 +544,10 @@ class KinovaTrainDataCollector:
             self.cap.release()
         pygame.quit()
         cv2.destroyAllWindows()
-        print("\n��ȫ�˳�")
+        print("\n安全退出")
         if self._output_dir:
-            print(f"\n���ݱ���λ��:\n   {self._output_dir}")
-            print("   ��ʽ: obs/(image, proprio) + action + timestamps")
+            print(f"\n数据保存位置:\n   {self._output_dir}")
+            print("   格式: obs/(image, proprio) + action + timestamps")
 
 
 # ======================================================================
@@ -556,11 +556,11 @@ class KinovaTrainDataCollector:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Kinova Gen3 ��0.5 ѵ�����ݲɼ���")
+    parser = argparse.ArgumentParser(description="Kinova Gen3 开0.5 错误输出")
     parser.add_argument("--task", type=str, required=True,
-                        help="������������ --task 'place the block into the bowl'")
+                        help="错误错误错误 --task 'place the block into the bowl'")
     parser.add_argument("--ip", type=str, default="192.168.8.10",
-                        help="��е�� IP ��ַ")
+                        help="机械臂 IP 地址")
     args = parser.parse_args()
 
     cfg = Config()
@@ -568,19 +568,19 @@ if __name__ == "__main__":
     cfg.robot_ip = args.ip
 
     print("=" * 60)
-    print("  Kinova Gen3 ��0.5 ѵ�����ݲɼ���")
+    print("  Kinova Gen3 开0.5 错误输出")
     if cfg.task:
-        print(f"  ����: {cfg.task}")
-    print("  �����ʽ: obs/(image, proprio) + action + language instruction")
-    print("  ����: 10Hz ͬ���ɼ�")
+        print(f"  错误: {cfg.task}")
+    print("  错误: obs/(image, proprio) + action + language instruction")
+    print("  错误: 10Hz 同步采集")
     print("=" * 60)
     print()
-    print("  ����ӳ��:")
-    print("    ��ҡ�� �� XY ƽ��    ��ҡ�� �� Roll / Pitch")
-    print("    LT/RT  �� Z ������   ʮ�ּ� �� Yaw")
-    print("    A �ؼ�צ  B ����צ   Y ��ʼ¼�� / Y ���� / X ɾ��")
-    print("    LB �ص�ԭ��   Menu �˳�")
-    print(f"  ���: ~/kinova_data/train_data_<timestamp>/episode_XXXX.h5")
+    print("  控制映射::")
+    print("    左摇杆 开 XY 平移    左摇杆 开 Roll / Pitch")
+    print("    LT/RT  开 Z 错误开   十字键 开 Yaw")
+    print("    A   B 错误   Y 开始录制 / Y 错误 / X 开")
+    print("    LB 回到原点   Menu 退出")
+    print(f"  输出: ~/kinova_data/train_data_<timestamp>/episode_XXXX.h5")
 
     collector = KinovaTrainDataCollector(cfg=cfg)
     try:

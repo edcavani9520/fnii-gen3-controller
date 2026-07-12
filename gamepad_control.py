@@ -22,6 +22,14 @@ from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
 from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.messages import Base_pb2
 
+# Create closure to set an event after an END or an ABORT
+def _check_for_end_or_abort(e):
+    def check(notification, e=e):
+        if notification.action_event == Base_pb2.ACTION_END \
+        or notification.action_event == Base_pb2.ACTION_ABORT:
+            e.set()
+    return check
+
 class KinovaJoyTeleop:
     def __init__(self, ip="192.168.8.10"):
         self.ip = ip
@@ -175,27 +183,52 @@ class KinovaJoyTeleop:
 
     def go_to_home_pose(self):
         """移动到预设原点位姿并打开夹爪"""
+        import threading
         print("\n回家...")
         self.base.Stop()
         time.sleep(0.1)
 
-        action = Base_pb2.Action()
-        action.name = "Home"
-        action.application_data = ""
+        # 确保 Single Level Servoing 模式
+        servo_mode = Base_pb2.ServoingModeInformation()
+        servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
+        self.base.SetServoingMode(servo_mode)
 
-        action.reach_pose.target_pose.x = 0.131
-        action.reach_pose.target_pose.y = -0.004
-        action.reach_pose.target_pose.z = 0.21
-        action.reach_pose.target_pose.theta_x = 176.39
-        action.reach_pose.target_pose.theta_y = 0.923
-        action.reach_pose.target_pose.theta_z = 90.271
+        # 构建单 waypoint 轨迹
+        waypoints = Base_pb2.WaypointList()
+        waypoints.duration = 0.0
+        waypoints.use_optimal_blending = False
+
+        wp = waypoints.waypoints.add()
+        wp.name = "home"
+        wp.cartesian_waypoint.pose.x = 0.131
+        wp.cartesian_waypoint.pose.y = -0.004
+        wp.cartesian_waypoint.pose.z = 0.21
+        wp.cartesian_waypoint.pose.theta_x = 176.39
+        wp.cartesian_waypoint.pose.theta_y = 0.923
+        wp.cartesian_waypoint.pose.theta_z = 90.271
+        wp.cartesian_waypoint.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+
+        # 订阅动作通知
+        e = threading.Event()
+        notif_handle = self.base.OnNotificationActionTopic(
+            _check_for_end_or_abort(e),
+            Base_pb2.NotificationOptions()
+        )
 
         try:
-            self.base.ExecuteAction(action)
-            self.control_gripper(0.0)
-            print("OK")
-        except Exception as e:
-            print(f"回到原点失败: {e}")
+            print("移动到原点...")
+            self.base.ExecuteWaypointTrajectory(waypoints)
+            finished = e.wait(20.0)
+            self.base.Unsubscribe(notif_handle)
+
+            if finished:
+                self.control_gripper(0.0)
+                print("OK")
+            else:
+                print("回到原点超时")
+        except Exception as ex:
+            self.base.Unsubscribe(notif_handle)
+            print(f"回到原点失败: {ex}")
 
         self.get_robot_pose()
 
