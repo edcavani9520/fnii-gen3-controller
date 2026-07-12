@@ -2,8 +2,8 @@
 """
 convert_kinova_to_lerobot.py
 
-Convert Kinova Gen3 HDF5 episodes to LeRobot dataset format,
-with automatic train/val split (90/10).
+Convert Kinova Gen3 HDF5 episodes to LeRobot dataset format.
+Supports merging multiple collection directories.
 """
 
 import os, sys, time, argparse, random
@@ -17,7 +17,7 @@ from tqdm import tqdm
 try:
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 except ImportError:
-    print("Install LeRobot: pip install git+https://github.com/physical-intelligence/lerobot.git")
+    print("Install: pip install git+https://github.com/physical-intelligence/lerobot.git")
     sys.exit(1)
 
 
@@ -29,20 +29,37 @@ def find_instruction(f):
     return "unnamed_task"
 
 
+def collect_h5_files(dirs):
+    """Scan multiple directories recursively for episode_*.h5 files."""
+    files = []
+    for d in dirs:
+        p = Path(d).expanduser().resolve()
+        if p.is_dir():
+            found = sorted(p.rglob("episode_*.h5"))
+            files.extend(found)
+            print(f"  {p}: {len(found)} episodes")
+        else:
+            print(f"  [skip] {p}: not a directory")
+    if not files:
+        print("ERROR: no episode_*.h5 files found in any given directory")
+        sys.exit(1)
+    # Deduplicate by full path, preserve order
+    seen = set()
+    unique = []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            unique.append(f)
+    return unique
+
+
 def convert(args):
-    h5_dir = Path(args.h5_dir)
-    output_dir = Path(args.output_dir)
     fps = args.fps
+    output_dir = Path(args.output_dir).expanduser()
     random.seed(42)
 
-    if not h5_dir.exists():
-        print(f"ERROR: {h5_dir} not found")
-        sys.exit(1)
-
-    h5_files = sorted(h5_dir.glob("episode_*.h5"))
-    if not h5_files:
-        print(f"No episode_*.h5 files in {h5_dir}")
-        sys.exit(1)
+    print("Scanning directories for HDF5 files...")
+    h5_files = collect_h5_files(args.h5_dir)
 
     n = len(h5_files)
     indices = list(range(n))
@@ -50,16 +67,15 @@ def convert(args):
     n_train = max(int(n * 0.9), 1)
     n_val = n - n_train
     train_set = set(indices[:n_train])
-    print(f"Found {n} episodes -> {n_train} train / {n_val} val")
+    print(f"\nTotal: {n} episodes -> {n_train} train / {n_val} val")
 
-    # Determine shapes
+    # Determine shapes from first file
     with h5py.File(h5_files[0], "r") as f:
         _, H, W = f["obs/image"].shape
 
     if output_dir.exists():
         import shutil; shutil.rmtree(output_dir)
 
-    # Create dataset
     dataset = LeRobotDataset.create(
         repo_id=output_dir.name,
         robot_type="kinova_gen3",
@@ -111,15 +127,12 @@ def convert(args):
 
     dataset.consolidate()
 
-    # Tag splits in episodes.parquet
+    # Write split info
     meta_file = output_dir / "meta" / "episodes.parquet"
     if meta_file.exists():
         import pandas as pd
         df = pd.read_parquet(meta_file)
-        # df has columns: episode_index, from, to, length
-        split_col = []
-        for ep_idx in range(len(df)):
-            split_col.append("train" if ep_idx in train_set else "val")
+        split_col = ["train" if i in train_set else "val" for i in range(len(df))]
         df["split"] = split_col
         df.to_parquet(meta_file, index=False)
 
@@ -130,15 +143,20 @@ def convert(args):
     print(f"\nopenpi config:")
     print(f"  data:")
     print(f"    repo_id: {output_dir.name}")
-    print(f"    root: {output_dir.parent}")
+    print(f"    root: {str(output_dir.parent)}")
     print(f"    train_split: train")
     print(f"    val_split: val")
     print(f"    image_key: observation.images.camera")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--h5-dir", required=True)
+    parser = argparse.ArgumentParser(
+        description="Convert Kinova Gen3 HDF5 to LeRobot dataset (supports merging multiple directories)"
+    )
+    parser.add_argument(
+        "--h5-dir", nargs="+", required=True,
+        help="One or more directories (recursively scanned for episode_*.h5)"
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--fps", type=int, default=10)
     args = parser.parse_args()
