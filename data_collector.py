@@ -190,7 +190,7 @@ class KinovaTrainDataCollector:
     #  输出错误开输出时间戳 ͼ+错误开+错误开
     # ================================================================
 
-    def _sync_step(self, axes, hat, buttons) -> Optional[dict]:
+    def _sync_step(self) -> Optional[dict]:
         """
         开开错误输出
         1. 开灰度图
@@ -236,6 +236,29 @@ class KinovaTrainDataCollector:
             -hat[0] * self.cfg.turn_limit,
         ], dtype=np.float64)
 
+
+        return {
+            "timestamp": time.time(),
+            "image": gray,               # (H, W) uint8
+            "joint_pos": joint_pos,      # (7,) float64
+            "gripper_pos": gripper_pos,  # scalar
+            "eef_pose": eef_pose,        # (6,) float64
+        }
+
+    # ================================================================
+    #  错误开开
+    # ================================================================
+
+    def _send_twist_if_needed(self, axes, hat) -> bool:
+        a0, a1, a2, a3, a4, a5 = axes
+        twist = np.array([
+            -a1 * self.cfg.speed_limit,
+            -a0 * self.cfg.speed_limit,
+            (a5 - a2) * self.cfg.speed_limit,
+            a3 * self.cfg.turn_limit,
+            -a4 * self.cfg.turn_limit,
+            -hat[0] * self.cfg.turn_limit,
+        ], dtype=np.float64)
         has_input = np.any(np.abs(twist) > 0.001)
         if has_input:
             cmd = Base_pb2.TwistCommand()
@@ -250,24 +273,7 @@ class KinovaTrainDataCollector:
             self.base.SendTwistCommand(cmd)
         else:
             self.base.Stop()
-
-        # ---- 4. 输出ͼ ----
-        if buttons.get(0):       # A = 关闭
-            self._send_gripper(1.0)
-        elif buttons.get(1):     # B = 打开
-            self._send_gripper(0.0)
-
-        return {
-            "timestamp": time.time(),
-            "image": gray,               # (H, W) uint8
-            "joint_pos": joint_pos,      # (7,) float64
-            "gripper_pos": gripper_pos,  # scalar
-            "eef_pose": eef_pose,        # (6,) float64
-        }
-
-    # ================================================================
-    #  错误开开
-    # ================================================================
+        return has_input
 
     def _send_gripper(self, pos: float):
         try:
@@ -426,7 +432,14 @@ class KinovaTrainDataCollector:
                     self._last_gripper_cmd = 0.0
 
                 # === 4. 输出错误时间戳 ͼ+错误开+错误 ===
-                data = self._sync_step(axes, hat, buttons)
+                # === 4. Send control (before capture, ensures responsiveness) ===
+                has_input = self._send_twist_if_needed(axes, hat)
+                if buttons.get(0):
+                    self._send_gripper(1.0)
+                elif buttons.get(1):
+                    self._send_gripper(0.0)
+
+                data = self._sync_step()
                 if data is None:
                     continue
 
