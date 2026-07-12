@@ -515,7 +515,7 @@ class KinovaTrainDataCollector:
     # 终端实时状态打印
     # ================================================================
     def go_to_home_pose(self):
-        """Move to home pose"""
+        """Move to Retract position via joint angles"""
         print("Home...")
         self.base.Stop()
         time.sleep(0.1)
@@ -524,19 +524,15 @@ class KinovaTrainDataCollector:
         servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
         self.base.SetServoingMode(servo_mode)
 
-        waypoints = Base_pb2.WaypointList()
-        waypoints.duration = 0.0
-        waypoints.use_optimal_blending = False
-
-        wp = waypoints.waypoints.add()
-        wp.name = "home"
-        wp.cartesian_waypoint.pose.x = 0.131
-        wp.cartesian_waypoint.pose.y = -0.004
-        wp.cartesian_waypoint.pose.z = 0.21
-        wp.cartesian_waypoint.pose.theta_x = 176.39
-        wp.cartesian_waypoint.pose.theta_y = 0.923
-        wp.cartesian_waypoint.pose.theta_z = 90.271
-        wp.cartesian_waypoint.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+        # Build joint angle action from Retract position
+        action = Base_pb2.Action()
+        action.name = "Home"
+        action.application_data = ""
+        angles = [0, 340, 180, 214, 0, 310, 90]  # Retract.xml joint values (degrees)
+        for i, val in enumerate(angles):
+            ja = action.reach_joint_angles.joint_angles.joint_angles.add()
+            ja.joint_identifier = i
+            ja.value = float(val)
 
         e = threading.Event()
         notif_handle = self.base.OnNotificationActionTopic(
@@ -545,8 +541,8 @@ class KinovaTrainDataCollector:
         )
 
         try:
-            print("Moving to home...")
-            self.base.ExecuteWaypointTrajectory(waypoints)
+            print("Moving to home (joint angles)...")
+            self.base.ExecuteAction(action)
             finished = e.wait(20.0)
             self.base.Unsubscribe(notif_handle)
             if finished:

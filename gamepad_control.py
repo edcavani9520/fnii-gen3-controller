@@ -182,33 +182,24 @@ class KinovaJoyTeleop:
             pass
 
     def go_to_home_pose(self):
-        """移动到预设原点位姿并打开夹爪"""
-        import threading
-        print("\n回家...")
+        """Move to Retract position via joint angles"""
+        print("Home...")
         self.base.Stop()
         time.sleep(0.1)
 
-        # 确保 Single Level Servoing 模式
         servo_mode = Base_pb2.ServoingModeInformation()
         servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
         self.base.SetServoingMode(servo_mode)
 
-        # 构建单 waypoint 轨迹
-        waypoints = Base_pb2.WaypointList()
-        waypoints.duration = 0.0
-        waypoints.use_optimal_blending = False
+        action = Base_pb2.Action()
+        action.name = "Home"
+        action.application_data = ""
+        angles = [0, 340, 180, 214, 0, 310, 90]
+        for i, val in enumerate(angles):
+            ja = action.reach_joint_angles.joint_angles.joint_angles.add()
+            ja.joint_identifier = i
+            ja.value = float(val)
 
-        wp = waypoints.waypoints.add()
-        wp.name = "home"
-        wp.cartesian_waypoint.pose.x = 0.131
-        wp.cartesian_waypoint.pose.y = -0.004
-        wp.cartesian_waypoint.pose.z = 0.21
-        wp.cartesian_waypoint.pose.theta_x = 176.39
-        wp.cartesian_waypoint.pose.theta_y = 0.923
-        wp.cartesian_waypoint.pose.theta_z = 90.271
-        wp.cartesian_waypoint.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
-
-        # 订阅动作通知
         e = threading.Event()
         notif_handle = self.base.OnNotificationActionTopic(
             _check_for_end_or_abort(e),
@@ -216,21 +207,18 @@ class KinovaJoyTeleop:
         )
 
         try:
-            print("移动到原点...")
-            self.base.ExecuteWaypointTrajectory(waypoints)
+            print("Moving home...")
+            self.base.ExecuteAction(action)
             finished = e.wait(20.0)
             self.base.Unsubscribe(notif_handle)
-
             if finished:
                 self.control_gripper(0.0)
                 print("OK")
             else:
-                print("回到原点超时")
+                print("Home timeout")
         except Exception as ex:
             self.base.Unsubscribe(notif_handle)
-            print(f"回到原点失败: {ex}")
-
-        self.get_robot_pose()
+            print(f"Home failed: {ex}")
 
 if __name__ == "__main__":
     teleop = KinovaJoyTeleop()
