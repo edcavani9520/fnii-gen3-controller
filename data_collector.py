@@ -66,8 +66,8 @@ class Config:
 
     # ---- 相机参数（采集分辨率必须和模型推理保持一致）----
     camera_id: int = 0
-    camera_width: int = 640
-    camera_height: int = 480
+    camera_width: int = 320
+    camera_height: int = 240
     camera_fps: int = 10            # 相机硬件帧率
 
     # ---- 数据集采集参数 ----
@@ -382,6 +382,7 @@ class KinovaTrainDataCollector:
             rec_label = "空闲 IDLE"
 
             while self._running:
+                _t = time.perf_counter()
                 # 1. 获取手柄输入
                 axes, hat, buttons = self._read_gamepad()
 
@@ -471,8 +472,11 @@ class KinovaTrainDataCollector:
                 if display_counter % 5 == 0:
                     self._print_status(axes, hat, rec_label)
 
-                # 维持固定10Hz周期
-                time.sleep(1.0 / self.cfg.sample_hz)
+                # 维持固定10Hz周期（自适应：减去己耗时，补足余量）
+                elapsed = time.perf_counter() - _t
+                remaining = 1.0 / self.cfg.sample_hz - elapsed
+                if remaining > 0:
+                    time.sleep(remaining)
 
         except KeyboardInterrupt:
             print("\n收到键盘中断 Ctrl+C")
