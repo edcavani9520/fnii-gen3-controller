@@ -98,7 +98,7 @@ def convert(args):
                 ],
             },
         },
-        root=output_dir.parent,
+        root=output_dir,
     )
 
     total_frames = 0
