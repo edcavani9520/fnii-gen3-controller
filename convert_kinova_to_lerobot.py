@@ -119,7 +119,7 @@ def convert(args):
                 "observation.images.camera": Image.fromarray(rgb),
                 "observation.state": states[i].astype(np.float32),
                 "action": actions[i].astype(np.float32),
-                "timestamp": np.float32(ts[i]) - t_offset,
+                "timestamp": np.array(np.float32(ts[i]) - t_offset, dtype=np.float32),
                 "task": str(instruction),
             })
         dataset.save_episode()
