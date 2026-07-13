@@ -136,6 +136,22 @@ def convert(args):
         df["split"] = split_col
         df.to_parquet(meta_file, index=False)
 
+    # Compatibility: generate tasks.jsonl for openpi (v2.1 format)
+    tasks_parquet = output_dir / "meta" / "tasks.parquet"
+    tasks_jsonl = output_dir / "meta" / "tasks.jsonl"
+    if tasks_parquet.exists() and not tasks_jsonl.exists():
+        try:
+            tasks_df = pd.read_parquet(tasks_parquet)
+            with open(tasks_jsonl, "w", encoding="utf-8") as f:
+                for _, row in tasks_df.iterrows():
+                    task_text = row.get("task", row.get("instruction", ""))
+                    if pd.isna(task_text):
+                        task_text = ""
+                    f.write(json.dumps({"task": task_text}) + "\n")
+            print(f"  tasks.jsonl written ({len(tasks_df)} tasks)")
+        except Exception as e:
+            print(f"  Warning: tasks.jsonl generation failed: {e}")
+
     elapsed = time.time() - t0
     print(f"\nDone: {n} episodes ({n_train} train / {n_val} val), "
           f"{total_frames} frames, {elapsed:.1f}s")
