@@ -112,7 +112,6 @@ def convert(args):
             ts = f["timestamps"][:]
             instruction = find_instruction(f)
 
-        t_offset = float(ts[0])
         for i in range(len(images)):
             rgb = np.stack([images[i]] * 3, axis=-1)
             dataset.add_frame({
