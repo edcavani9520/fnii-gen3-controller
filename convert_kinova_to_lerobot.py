@@ -123,7 +123,10 @@ def convert(args):
         dataset.save_episode()
         total_frames += len(images)
 
-    dataset.consolidate()
+    if hasattr(dataset, "consolidate"):
+        dataset.consolidate()
+    else:
+        print("  consolidate not needed (episodes already saved)")
 
     # Write split info
     meta_file = output_dir / "meta" / "episodes.parquet"
