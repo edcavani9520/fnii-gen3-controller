@@ -112,14 +112,14 @@ def convert(args):
             ts = f["timestamps"][:]
             instruction = find_instruction(f)
 
-        t_offset = np.float32(float(ts[0]))
+        t_offset = float(ts[0])
         for i in range(len(images)):
             rgb = np.stack([images[i]] * 3, axis=-1)
             dataset.add_frame({
                 "observation.images.camera": Image.fromarray(rgb),
                 "observation.state": states[i].astype(np.float32),
                 "action": actions[i].astype(np.float32),
-                "timestamp": np.array([np.float32(ts[i]) - t_offset], dtype=np.float32),
+                "timestamp": float(ts[i]) - t_offset,
                 "task": str(instruction),
             })
         dataset.save_episode()
