@@ -1,18 +1,18 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 convert_kinova_to_lerobot.py
 
-Convert Kinova Gen3 HDF5 episodes to LeRobot dataset format.
-Supports merging multiple collection directories.
+Convert Kinova Gen3 HDF5 episodes to LeRobot dataset format (RGB only).
 """
 
-import os, sys, time, argparse, random
+import os, sys, time, argparse, random, json
 from pathlib import Path
 
 import h5py
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+import pandas as pd
 
 try:
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -30,7 +30,6 @@ def find_instruction(f):
 
 
 def collect_h5_files(dirs):
-    """Scan multiple directories recursively for episode_*.h5 files."""
     files = []
     for d in dirs:
         p = Path(d).expanduser().resolve()
@@ -41,9 +40,8 @@ def collect_h5_files(dirs):
         else:
             print(f"  [skip] {p}: not a directory")
     if not files:
-        print("ERROR: no episode_*.h5 files found in any given directory")
+        print("ERROR: no episode_*.h5 files found")
         sys.exit(1)
-    # Deduplicate by full path, preserve order
     seen = set()
     unique = []
     for f in files:
@@ -71,7 +69,7 @@ def convert(args):
 
     # Determine shapes from first file
     with h5py.File(h5_files[0], "r") as f:
-        _, H, W = f["obs/image"].shape
+        _, H, W, _ = f["obs/image"].shape
 
     if output_dir.exists():
         import shutil; shutil.rmtree(output_dir)
@@ -113,9 +111,8 @@ def convert(args):
             instruction = find_instruction(f)
 
         for i in range(len(images)):
-            rgb = np.stack([images[i]] * 3, axis=-1)
             dataset.add_frame({
-                "observation.images.camera": Image.fromarray(rgb),
+                "observation.images.camera": Image.fromarray(images[i]),
                 "observation.state": states[i].astype(np.float32),
                 "action": actions[i].astype(np.float32),
                 "task": str(instruction),
@@ -125,55 +122,40 @@ def convert(args):
 
     if hasattr(dataset, "consolidate"):
         dataset.consolidate()
-    else:
-        print("  consolidate not needed (episodes already saved)")
 
-    # Write split info
+    # Write split
     meta_file = output_dir / "meta" / "episodes.parquet"
     if meta_file.exists():
-        import pandas as pd
         df = pd.read_parquet(meta_file)
-        split_col = ["train" if i in train_set else "val" for i in range(len(df))]
-        df["split"] = split_col
+        df["split"] = ["train" if i in train_set else "val" for i in range(len(df))]
         df.to_parquet(meta_file, index=False)
 
-    # Compatibility: generate tasks.jsonl for openpi (v2.1 format)
+    # tasks.jsonl
     tasks_parquet = output_dir / "meta" / "tasks.parquet"
     tasks_jsonl = output_dir / "meta" / "tasks.jsonl"
     if tasks_parquet.exists() and not tasks_jsonl.exists():
         try:
             tasks_df = pd.read_parquet(tasks_parquet)
-            with open(tasks_jsonl, "w", encoding="utf-8") as f:
+            with open(tasks_jsonl, "w") as f:
                 for _, row in tasks_df.iterrows():
                     task_text = row.get("task", row.get("instruction", ""))
                     if pd.isna(task_text):
                         task_text = ""
                     f.write(json.dumps({"task": task_text}) + "\n")
-            print(f"  tasks.jsonl written ({len(tasks_df)} tasks)")
         except Exception as e:
-            print(f"  Warning: tasks.jsonl generation failed: {e}")
+            print(f"  Warning: tasks.jsonl failed: {e}")
 
     elapsed = time.time() - t0
     print(f"\nDone: {n} episodes ({n_train} train / {n_val} val), "
           f"{total_frames} frames, {elapsed:.1f}s")
     print(f"Dataset: {output_dir}")
-    print(f"\nopenpi config:")
-    print(f"  data:")
-    print(f"    repo_id: {output_dir.name}")
-    print(f"    root: {str(output_dir.parent)}")
-    print(f"    train_split: train")
-    print(f"    val_split: val")
-    print(f"    image_key: observation.images.camera")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Convert Kinova Gen3 HDF5 to LeRobot dataset (supports merging multiple directories)"
     )
-    parser.add_argument(
-        "--h5-dir", nargs="+", required=True,
-        help="One or more directories (recursively scanned for episode_*.h5)"
-    )
+    parser.add_argument("--h5-dir", nargs="+", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--fps", type=int, default=10)
     args = parser.parse_args()

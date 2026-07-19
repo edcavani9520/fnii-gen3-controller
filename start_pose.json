@@ -1,0 +1,6 @@
+{
+  "name": "start",
+  "joint_angles_deg": [359.758, 16.801, 181.634, 291.625, 357.901, 267.745, 91.057],
+  "description": "Start position captured from Kinova monitoring",
+  "origin": "data_collector_monitoring_2026-07-15"
+}

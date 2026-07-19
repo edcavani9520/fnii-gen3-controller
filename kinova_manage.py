@@ -88,6 +88,13 @@ class KinovaManager:
         self.base_cyclic = BaseCyclicClient(self.router)
         print(f"✅ Connected to Kinova at {self.ip}")
 
+        # 开启 tool power（为 Robotiq 夹爪供电）
+        tool_power = Base_pb2.ToolPowerStatus()
+        tool_power.toolPowerStatus = True
+        self.base.SetToolPowerStatus(tool_power)
+        print("🔌 Tool power enabled")
+        time.sleep(1.0)  # 等待夹爪完成 boot
+
     def disconnect(self):
         if self._torque_arm is not None:
             self.shutdown_torque()

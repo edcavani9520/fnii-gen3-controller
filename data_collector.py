@@ -60,9 +60,9 @@ from kortex_api.autogen.messages import Base_pb2, BaseCyclic_pb2
 class Config:
     # ---- 机械臂参数 ----
     robot_ip: str = "192.168.8.10"
-    speed_limit: float = 0.20       # 直线运动最大速度 m/s
-    turn_limit: float = 20.0        # 旋转最大速度 °/s
-    deadzone: float = 0.1           # 摇杆输入死区
+    speed_limit: float = 0.10       # 直线运动最大速度 m/s
+    turn_limit: float = 10.0        # 旋转最大速度 °/s
+    deadzone: float = 0.15           # 摇杆输入死区
 
     # ---- 相机参数（采集分辨率必须和模型推理保持一致）----
     camera_id: int = 0
@@ -129,6 +129,7 @@ class KinovaTrainDataCollector:
         self._prev_y = False
         self._prev_x = False
         self._prev_lb = False
+        self._prev_rb = False
 
         # ---- 差分action计算缓存 ----
         self._prev_eef_pose: Optional[np.ndarray] = None
@@ -203,10 +204,10 @@ class KinovaTrainDataCollector:
         ret, frame = self.cap.read()
         if not ret:
             return None
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         # Resize to target resolution (camera may output different size than config)
-        if gray.shape[0] != self.cfg.camera_height or gray.shape[1] != self.cfg.camera_width:
-            gray = cv2.resize(gray, (self.cfg.camera_width, self.cfg.camera_height))
+        if rgb.shape[0] != self.cfg.camera_height or rgb.shape[1] != self.cfg.camera_width:
+            rgb = cv2.resize(rgb, (self.cfg.camera_width, self.cfg.camera_height))
 
         # 获取机械臂实时反馈数据
         try:
@@ -232,7 +233,7 @@ class KinovaTrainDataCollector:
 
         return {
             "timestamp": time.time(),
-            "image": gray,               # (H, W) uint8
+            "image": rgb,                 # (H, W, 3) uint8
             "joint_pos": joint_pos,      # (7,) float64
             "gripper_pos": gripper_pos,  # 标量
             "eef_pose": eef_pose,        # (6,) float64
@@ -292,7 +293,7 @@ class KinovaTrainDataCollector:
         # 观测分组 obs
         grp_obs = f.create_group("obs")
         grp_obs.create_dataset(
-            "image", shape=(0, H, W), maxshape=(None, H, W),
+            "image", shape=(0, H, W, 3), maxshape=(None, H, W, 3),
             dtype=np.uint8, compression="gzip", compression_opts=4,
         )
         grp_obs.create_dataset(
@@ -347,7 +348,7 @@ class KinovaTrainDataCollector:
 
         # 动态扩容数据集长度
         f["timestamps"].resize((cur + 1,))
-        f["obs/image"].resize((cur + 1, f["obs/image"].shape[1], f["obs/image"].shape[2]))
+        f["obs/image"].resize((cur + 1, f["obs/image"].shape[1], f["obs/image"].shape[2], 3))
         f["obs/proprio"].resize((cur + 1, 8))
         f["action"].resize((cur + 1, 7))
 
@@ -383,6 +384,7 @@ class KinovaTrainDataCollector:
         try:
             print("数据采集主循环启动，目标采样频率 10Hz")
             print("  Y键：开始/停止录制片段 | X键：舍弃当前片段")
+            print("  RB(右肩键)：回到 start 位置 (start_pose.json)")
             print("  Menu菜单键：退出程序\n")
 
             display_counter = 0
@@ -415,8 +417,13 @@ class KinovaTrainDataCollector:
                         self._stop_recording(delete=True)
                         rec_label = "空闲 IDLE"
 
+                # RB按键：回到 start 位置
+                if buttons.get(5) and not self._prev_rb:
+                    self.go_to_start_pose()
+
                 self._prev_y = y_pressed
                 self._prev_x = x_pressed
+                self._prev_rb = bool(buttons.get(5))
 
                 # 3. 更新夹爪目标指令状态
                 if buttons.get(0):
@@ -476,7 +483,7 @@ class KinovaTrainDataCollector:
 
                 # 控制台状态栏定期刷新
                 display_counter += 1
-                if display_counter % 5 == 0:
+                if display_counter % 2 == 0:
                     self._print_status(axes, hat, rec_label)
 
                 # 维持固定10Hz周期（自适应：减去己耗时，补足余量）
@@ -562,6 +569,58 @@ class KinovaTrainDataCollector:
             self.base.Unsubscribe(notif_handle)
             print(f"Home failed: {ex}")
 
+    def go_to_start_pose(self):
+        """Move to the joint angles defined in start_pose.json"""
+        import json
+
+        pose_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "start_pose.json")
+        if not os.path.exists(pose_path):
+            print(f"[RB] start_pose.json 未找到: {pose_path}")
+            return
+
+        with open(pose_path) as f:
+            pose_data = json.load(f)
+        angles = pose_data.get("joint_angles_deg")
+        if not angles or len(angles) != 7:
+            print(f"[RB] start_pose.json 关节角度格式错误")
+            return
+
+        print("[RB] Moving to start pose...")
+        self.base.Stop()
+        time.sleep(0.1)
+
+        servo_mode = Base_pb2.ServoingModeInformation()
+        servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
+        self.base.SetServoingMode(servo_mode)
+
+        action = Base_pb2.Action()
+        action.name = "StartPose"
+        action.application_data = ""
+        for i, val in enumerate(angles):
+            ja = action.reach_joint_angles.joint_angles.joint_angles.add()
+            ja.joint_identifier = i
+            ja.value = float(val)
+
+        e = threading.Event()
+        notif_handle = self.base.OnNotificationActionTopic(
+            _check_for_end_or_abort(e),
+            Base_pb2.NotificationOptions()
+        )
+
+        try:
+            print(f"[RB] Executing joint angles: {angles}")
+            self.base.ExecuteAction(action)
+            finished = e.wait(20.0)
+            self.base.Unsubscribe(notif_handle)
+            if finished:
+                self._prev_eef_pose = None
+                print("[RB] Start pose reached")
+            else:
+                print("[RB] Start pose timeout")
+        except Exception as ex:
+            self.base.Unsubscribe(notif_handle)
+            print(f"[RB] Start pose failed: {ex}")
+
     def _print_status(self, axes, hat, rec_label):
         a0, a1, _, a3, a4, _ = axes
         if self._last_gripper_cmd > 0.5:
@@ -604,6 +663,10 @@ class KinovaTrainDataCollector:
         # 释放摄像头
         if self.cap:
             self.cap.release()
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
         pygame.quit()
         try:
             cv2.destroyAllWindows()
@@ -649,7 +712,8 @@ if __name__ == "__main__":
     print("    B键        → 夹爪打开")
     print("    Y键        → 开始 / 停止录制片段")
     print("    X键        → 舍弃当前录制片段")
-    print("    LB按键      → 预留：机械臂回原点")
+    print("    LB按键      → 机械臂回原点")
+    print("    RB按键      → 回到 start 位置 (start_pose.json)")
     print("    Menu菜单键 → 退出程序")
     print(f"  文件输出路径：~/kinova_data/train_data_<时间戳>/episode_XXXX.h5")
 
