@@ -532,3 +532,34 @@ rclpy.shutdown()
 
 ---
 
+## 8. 实时 RGB 去模糊 WS 推理
+
+本仓库提供轻量入口 `ws_inference_realtime_deblur.py`。去模糊算法仍由独立
+仓库维护；入口会加载该仓库的标准 WS 包装器，并自动把当前目录作为
+`--controller-root`。标准包装器只替换相机取图步骤，策略收到的
+`observation/image` 是实时 RGB Wiener 去模糊后的图像，其他 Pi05 控制与
+WebSocket 推理流程保持不变。
+
+公开仓库：
+
+- Gen3 Controller：<https://github.com/edcavani9520/fnii-gen3-controller.git>
+- RGB 去模糊：<https://github.com/edcavani9520/Robot-Kinematics-Guided-Spatially-Varying-Motion-Deblurrin.git>
+
+推荐克隆为同级目录：
+
+```powershell
+git clone https://github.com/edcavani9520/fnii-gen3-controller.git
+git clone https://github.com/edcavani9520/Robot-Kinematics-Guided-Spatially-Varying-Motion-Deblurrin.git
+cd fnii-gen3-controller
+python ws_inference_realtime_deblur.py `
+  --deblur-root ../Robot-Kinematics-Guided-Spatially-Varying-Motion-Deblurrin `
+  --ws-host localhost --ws-port 8000 `
+  --K 0.01 --depth 0.5 --exposure 0.03 --fx 733.37 --fy 733.37
+```
+
+`--deblur-root` 只由当前轻量入口处理，其余参数原样转发给去模糊仓库中的
+标准启动脚本。运行前需要安装两个仓库各自声明的依赖，包括 NumPy、SciPy、
+OpenCV、Kinova Kortex、OpenPI/WS，以及支持同步客户端的 `websockets`。
+
+---
+
