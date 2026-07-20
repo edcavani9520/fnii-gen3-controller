@@ -79,6 +79,44 @@ python visionpro_control.py
 
 ```
 
+### 4. π0.5 / OpenPI 真机推理正式版
+
+真机运行需要开两个终端：终端 1 保持 OpenPI policy server 运行，终端 2 再启动 Kinova 控制脚本。
+
+#### 终端 1：启动 OpenPI 推理服务
+
+```bash
+cd ~/openpi
+
+CUDA_VISIBLE_DEVICES=0 \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 \
+uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=pi05_kinova_lora \
+  --policy.dir=/home/kinova-1/openpi/checkpoints/pi05_kinova_lora/kinova_cube_20260717_lora_gemma2b_fixed_5000_bs32/4999
+```
+
+看到下面日志后保持该终端不要关闭：
+
+```bash
+server listening on 0.0.0.0:8000
+```
+
+#### 终端 2：启动真机控制
+
+```bash
+cd ~/fnii-gen3-controller
+
+python pi05_ws_control.py \
+  --control-mode twist \
+  --freq 5 \
+  --action-steps 1 \
+  --action-scale 0.7 \
+  --min-ee-z 0.01 \
+  --camera-drain-frames 1 \
+  --log-every 1
+```
+
 ---
 
 ## ⚠️ 注意事项
@@ -531,6 +569,7 @@ rclpy.shutdown()
 对于数据采集 + 视觉类项目，推荐 ROS 2。
 
 ---
+<<<<<<< Updated upstream
 
 ## 8. 实时 RGB 去模糊 WS 推理
 
@@ -563,3 +602,5 @@ OpenCV、Kinova Kortex、OpenPI/WS，以及支持同步客户端的 `websockets`
 
 ---
 
+=======
+>>>>>>> Stashed changes
