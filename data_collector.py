@@ -66,13 +66,24 @@ class Config:
 
     # ---- 相机参数（采集分辨率必须和模型推理保持一致）----
     camera_id: int = 0
+    camera_native_width: int = 640
+    camera_native_height: int = 480
+    camera_native_fps: int = 25
     camera_width: int = 320
     camera_height: int = 240
-    camera_fps: int = 10            # 相机硬件帧率
+    camera_exposure_raw: float = 100.0
+    camera_model: str = "Microdia Integrated_Webcam_HD"
+    # 标签标称 75°无畸变；按 320x240 对角 FOV=75°、方形像素估算。
+    camera_fx: Optional[float] = 260.6450745682411
+    camera_fy: Optional[float] = 260.6450745682411
+    camera_cx: Optional[float] = 159.5
+    camera_cy: Optional[float] = 119.5
+    camera_intrinsics_source: str = "estimated_diagonal_fov_75deg"
 
     # ---- 数据集采集参数 ----
     output_root: str = os.path.expanduser("~/kinova_data")
     sample_hz: int = 10             # 整体同步采样频率10Hz
+    flush_interval: int = 10         # 分批落盘，避免每帧 flush 阻塞采集循环
 
     # ---- 任务信息 ----
     task: str = ""
@@ -116,6 +127,12 @@ class KinovaTrainDataCollector:
 
         # ---- 相机采集对象 ----
         self.cap: Optional[cv2.VideoCapture] = None
+        self._camera_backend: str = ""
+        self._camera_native_width: int = 0
+        self._camera_native_height: int = 0
+        self._camera_native_fps: float = 0.0
+        self._camera_exposure_raw: float = 0.0
+        self._exposure_seconds: float = 0.0
 
         # ---- 录制状态变量 ----
         self._recording = False         # 是否正在录制
@@ -157,21 +174,61 @@ class KinovaTrainDataCollector:
     def connect_camera(self):
         """打开相机，手动控制曝光"""
         self.cap = cv2.VideoCapture(self.cfg.camera_id)
+        if not self.cap.isOpened():
+            raise RuntimeError("无法打开相机")
 
-        # 先切换到手动曝光模式，再设置固定曝光值
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.0)   # 0=手动
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, 100)        # 手动曝光值（越小越暗）
+        self._camera_backend = self.cap.getBackendName()
+        if self._camera_backend != "V4L2":
+            raise RuntimeError(
+                f"未验证的相机后端 {self._camera_backend!r}："
+                "曝光原始值不能可靠换算为秒"
+            )
 
-        # 设置分辨率和帧率
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.camera_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.camera_height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.cfg.camera_fps)
+        # V4L2 菜单值 1=Manual；UVC exposure_time_absolute 单位为 100 us。
+        if not self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0):
+            raise RuntimeError("无法切换 V4L2 手动曝光模式")
+        if not self.cap.set(cv2.CAP_PROP_EXPOSURE, self.cfg.camera_exposure_raw):
+            raise RuntimeError("无法设置 V4L2 曝光值")
+
+        # 请求摄像头原生模式；H5 输出仍在 _sync_step 中缩放为 320x240。
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.camera_native_width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.camera_native_height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.cfg.camera_native_fps)
 
         ret, frame = self.cap.read()
         if not ret:
             raise RuntimeError("相机读取图像失败，请检查摄像头")
+        self._camera_native_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._camera_native_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._camera_native_fps = float(self.cap.get(cv2.CAP_PROP_FPS))
+        auto_exposure = float(self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE))
+        self._camera_exposure_raw = float(self.cap.get(cv2.CAP_PROP_EXPOSURE))
+        self._exposure_seconds = self._camera_exposure_raw * 1e-4
+        if auto_exposure != 1.0:
+            raise RuntimeError(
+                f"V4L2 手动曝光未生效，实际 AUTO_EXPOSURE={auto_exposure}"
+            )
+        if not np.isclose(
+            self._camera_exposure_raw, self.cfg.camera_exposure_raw, atol=0.5
+        ):
+            raise RuntimeError(
+                "V4L2 曝光设置未生效："
+                f"请求 {self.cfg.camera_exposure_raw}，实际 {self._camera_exposure_raw}"
+            )
         actual_h, actual_w = frame.shape[:2]
-        print(f"相机初始化完成：{actual_w}×{actual_h} 目标帧率 {self.cfg.camera_fps} FPS")
+        if (actual_w, actual_h) != (
+            self.cfg.camera_native_width,
+            self.cfg.camera_native_height,
+        ):
+            raise RuntimeError(
+                f"相机原生分辨率不匹配：请求 "
+                f"{self.cfg.camera_native_width}x{self.cfg.camera_native_height}，"
+                f"实际 {actual_w}x{actual_h}"
+            )
+        print(
+            f"相机初始化完成：{actual_w}×{actual_h} "
+            f"{self._camera_native_fps:g} FPS，曝光 {self._exposure_seconds:g}s"
+        )
 
     # ================================================================
     # 读取手柄所有轴、十字键、按键原始输入
@@ -204,6 +261,8 @@ class KinovaTrainDataCollector:
         ret, frame = self.cap.read()
         if not ret:
             return None
+        # 以曝光区间中点近似图像时间戳，优于机器人反馈读取完成后再记时。
+        image_timestamp = time.time() - self._exposure_seconds / 2.0
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         # Resize to target resolution (camera may output different size than config)
         if rgb.shape[0] != self.cfg.camera_height or rgb.shape[1] != self.cfg.camera_width:
@@ -232,7 +291,7 @@ class KinovaTrainDataCollector:
         ], dtype=np.float64)
 
         return {
-            "timestamp": time.time(),
+            "timestamp": image_timestamp,
             "image": rgb,                 # (H, W, 3) uint8
             "joint_pos": joint_pos,      # (7,) float64
             "gripper_pos": gripper_pos,  # 标量
@@ -326,9 +385,29 @@ class KinovaTrainDataCollector:
         f.attrs["robot_ip"] = self.cfg.robot_ip
         f.attrs["speed_limit"] = self.cfg.speed_limit
         f.attrs["turn_limit"] = self.cfg.turn_limit
-        f.attrs["camera_fps"] = self.cfg.camera_fps
+        f.attrs["camera_fps"] = self._camera_native_fps
         f.attrs["camera_width"] = W
         f.attrs["camera_height"] = H
+        f.attrs["camera_native_width"] = self._camera_native_width
+        f.attrs["camera_native_height"] = self._camera_native_height
+        f.attrs["camera_native_fps"] = self._camera_native_fps
+        f.attrs["camera_backend"] = self._camera_backend
+        f.attrs["camera_model"] = self.cfg.camera_model
+        f.attrs["auto_exposure_mode"] = "manual"
+        f.attrs["exposure_raw"] = self._camera_exposure_raw
+        f.attrs["exposure_seconds"] = self._exposure_seconds
+        intrinsics = (
+            self.cfg.camera_fx,
+            self.cfg.camera_fy,
+            self.cfg.camera_cx,
+            self.cfg.camera_cy,
+        )
+        if any(value is not None for value in intrinsics):
+            if not all(value is not None for value in intrinsics):
+                raise ValueError("camera_fx/fy/cx/cy 必须同时提供")
+            for name, value in zip(("fx", "fy", "cx", "cy"), intrinsics):
+                f.attrs[name] = float(value)
+            f.attrs["camera_intrinsics_source"] = self.cfg.camera_intrinsics_source
         f.attrs["sample_hz"] = self.cfg.sample_hz
         f.attrs["date_collected"] = datetime.datetime.now().isoformat()
         f.attrs["success"] = True
@@ -357,7 +436,8 @@ class KinovaTrainDataCollector:
         f["obs/image"][cur] = image
         f["obs/proprio"][cur] = proprio
         f["action"][cur] = action
-        f.flush()
+        if (cur + 1) % self.cfg.flush_interval == 0:
+            f.flush()
 
     def _close_episode(self):
         """关闭当前HDF5文件，打印片段统计信息"""
