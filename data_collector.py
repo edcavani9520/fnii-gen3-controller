@@ -25,6 +25,7 @@ Kinova Gen3 数据采集器 - π0.5 训练格式
 
 启动示例：
   python data_collector.py --task "place the block into the bowl"
+  python data_collector.py --task "place the block into the bowl" --speed-scale 3
 """
 
 import sys
@@ -62,6 +63,7 @@ class Config:
     robot_ip: str = "192.168.8.10"
     speed_limit: float = 0.10       # 直线运动最大速度 m/s
     turn_limit: float = 10.0        # 旋转最大速度 °/s
+    speed_scale: float = 1.0        # 手柄速度倍率（由命令行 --speed-scale 设置）
     deadzone: float = 0.15           # 摇杆输入死区
 
     # ---- 相机参数（采集分辨率必须和模型推理保持一致）----
@@ -385,6 +387,7 @@ class KinovaTrainDataCollector:
         f.attrs["robot_ip"] = self.cfg.robot_ip
         f.attrs["speed_limit"] = self.cfg.speed_limit
         f.attrs["turn_limit"] = self.cfg.turn_limit
+        f.attrs["speed_scale"] = self.cfg.speed_scale
         f.attrs["camera_fps"] = self._camera_native_fps
         f.attrs["camera_width"] = W
         f.attrs["camera_height"] = H
@@ -463,6 +466,8 @@ class KinovaTrainDataCollector:
     def run(self):
         try:
             print("数据采集主循环启动，目标采样频率 10Hz")
+            print(f"  手柄速度：平移 {self.cfg.speed_limit:g} m/s，"
+                  f"旋转 {self.cfg.turn_limit:g} deg/s（倍率 {self.cfg.speed_scale:g}x）")
             print("  Y键：开始/停止录制片段 | X键：舍弃当前片段")
             print("  RB(右肩键)：回到 start 位置 (start_pose.json)")
             print("  Menu菜单键：退出程序\n")
@@ -769,16 +774,26 @@ if __name__ == "__main__":
                         help="当前任务语言指令，示例：--task 'place the block into the bowl'")
     parser.add_argument("--ip", type=str, default="192.168.8.10",
                         help="机械臂IP地址")
+    parser.add_argument("--speed-scale", type=float, default=1.0,
+                        help="手柄末端速度倍率，默认 1；例如 3 表示速度提高到 3 倍")
     args = parser.parse_args()
+
+    if args.speed_scale <= 0:
+        parser.error("--speed-scale 必须大于 0")
 
     cfg = Config()
     cfg.task = args.task
     cfg.robot_ip = args.ip
+    cfg.speed_scale = args.speed_scale
+    cfg.speed_limit *= args.speed_scale
+    cfg.turn_limit *= args.speed_scale
 
     print("=" * 60)
     print("  Kinova Gen3 π0.5 训练数据采集器")
     if cfg.task:
         print(f"  当前任务指令：{cfg.task}")
+    print(f"  手柄速度倍率：{cfg.speed_scale:g}x "
+          f"（平移 {cfg.speed_limit:g} m/s，旋转 {cfg.turn_limit:g} deg/s）")
     print("  数据集结构：obs/(image, proprio) + action + language instruction")
     print("  采集模式：10Hz 图像+机器人状态同步采样")
     print("=" * 60)
